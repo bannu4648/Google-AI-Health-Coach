@@ -1,0 +1,34 @@
+# Secrets — never commit
+.env
+credentials.json
+token.json
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# Local runtime data
+data/*.sqlite3
+data/*.sqlite
+data/*.db
+**/*.sqlite3
+**/*.sqlite
+**/*.db
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
