@@ -7,12 +7,15 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
+from collections.abc import Callable
 from enum import Enum
-from typing import Any
+from typing import Any, TypeVar
 
 from dotenv import load_dotenv
 from mistralai.client import Mistral
+from mistralai.client.errors import MistralError
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from ..core.types import DATA_TYPE_PROMPT_LIST, normalize_query_payload
@@ -27,6 +30,17 @@ logger = logging.getLogger(__name__)
 MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-large-latest")
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
 MISTRAL_CALL_DELAY_SECONDS = float(os.getenv("MISTRAL_CALL_DELAY_SECONDS", "2"))
+MISTRAL_RATE_LIMIT_MAX_RETRIES = int(os.getenv("MISTRAL_RATE_LIMIT_MAX_RETRIES", "3"))
+MISTRAL_RATE_LIMIT_BACKOFF_SECONDS = float(
+    os.getenv("MISTRAL_RATE_LIMIT_BACKOFF_SECONDS", "2")
+)
+
+T = TypeVar("T")
+
+RATE_LIMIT_USER_REPLY = (
+    "Mistral's API rate limit was hit — I've queued a short pause and will be ready "
+    "again in a few seconds. Please resend your message."
+)
 
 
 class Intent(str, Enum):
@@ -343,11 +357,16 @@ Rules:
 class AIEngine:
     """Routes natural-language messages to structured intents via Mistral JSON mode."""
 
+    _last_call_at: float = 0.0
+    _call_lock = threading.Lock()
+
     def __init__(
         self,
         api_key: str | None = None,
         model_name: str = MISTRAL_MODEL,
         call_delay_seconds: float | None = None,
+        rate_limit_max_retries: int | None = None,
+        rate_limit_backoff_seconds: float | None = None,
     ):
         key = api_key or MISTRAL_API_KEY
         if not key:
@@ -359,10 +378,45 @@ class AIEngine:
             if call_delay_seconds is None
             else call_delay_seconds
         )
+        self._rate_limit_max_retries = (
+            MISTRAL_RATE_LIMIT_MAX_RETRIES
+            if rate_limit_max_retries is None
+            else rate_limit_max_retries
+        )
+        self._rate_limit_backoff_seconds = (
+            MISTRAL_RATE_LIMIT_BACKOFF_SECONDS
+            if rate_limit_backoff_seconds is None
+            else rate_limit_backoff_seconds
+        )
 
     @property
     def call_delay_seconds(self) -> float:
         return self._call_delay_seconds
+
+    @staticmethod
+    def _is_rate_limit_error(exc: BaseException) -> bool:
+        if isinstance(exc, MistralError) and exc.status_code == 429:
+            return True
+        message = str(exc).lower()
+        return "429" in message or "rate limit" in message
+
+    def _wait_for_call_slot(self) -> None:
+        """Ensure a minimum gap between Mistral calls (shared across requests)."""
+        if self._call_delay_seconds <= 0:
+            return
+        with self._call_lock:
+            elapsed = time.monotonic() - AIEngine._last_call_at
+            remaining = self._call_delay_seconds - elapsed
+            if remaining > 0:
+                logger.info(
+                    "Waiting %.1fs before Mistral call (rate spacing).",
+                    remaining,
+                )
+                time.sleep(remaining)
+
+    def _mark_call_completed(self) -> None:
+        with self._call_lock:
+            AIEngine._last_call_at = time.monotonic()
 
     def _throttle_after_llm_call(self) -> None:
         """Pause after each Mistral API call to reduce rate-limit pressure."""
@@ -373,6 +427,36 @@ class AIEngine:
             self._call_delay_seconds,
         )
         time.sleep(self._call_delay_seconds)
+        self._mark_call_completed()
+
+    def _rate_limited_call(self, purpose: str, call: Callable[[], T]) -> T:
+        """Space Mistral calls and retry transient HTTP 429 rate limits."""
+        self._wait_for_call_slot()
+        last_exc: BaseException | None = None
+        for attempt in range(self._rate_limit_max_retries + 1):
+            try:
+                result = call()
+                self._throttle_after_llm_call()
+                return result
+            except Exception as exc:
+                last_exc = exc
+                if (
+                    self._is_rate_limit_error(exc)
+                    and attempt < self._rate_limit_max_retries
+                ):
+                    wait = self._rate_limit_backoff_seconds * (2**attempt)
+                    logger.warning(
+                        "Mistral rate limit during %s (attempt %d/%d); retrying in %.1fs.",
+                        purpose,
+                        attempt + 1,
+                        self._rate_limit_max_retries,
+                        wait,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise
+        assert last_exc is not None
+        raise last_exc
 
     def route_message(
         self,
@@ -391,19 +475,20 @@ class AIEngine:
         prompt_parts.append(f"User message: {user_text.strip()}")
         prompt = "\n\n".join(prompt_parts)
 
-        llm_called = False
         started = time.perf_counter()
         try:
-            response = self._client.chat.complete(
-                model=self._model,
-                messages=[
-                    {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.2,
+            response = self._rate_limited_call(
+                "route_message",
+                lambda: self._client.chat.complete(
+                    model=self._model,
+                    messages=[
+                        {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.2,
+                ),
             )
-            llm_called = True
             raw = response.choices[0].message.content or "{}"
             parsed = json.loads(raw)
             routed = RouterResponse.model_validate(parsed)
@@ -421,16 +506,15 @@ class AIEngine:
             )
             return routed
         except (json.JSONDecodeError, ValidationError, ValueError) as exc:
-            if llm_called:
-                record_llm_call(
-                    purpose="route_message",
-                    model=self._model,
-                    status="parse_error",
-                    latency_ms=int((time.perf_counter() - started) * 1000),
-                    prompt={"user_text": user_text, "conversation_context": conversation_context},
-                    response={"raw": locals().get("raw"), "parsed": locals().get("parsed")},
-                    error=str(exc),
-                )
+            record_llm_call(
+                purpose="route_message",
+                model=self._model,
+                status="parse_error",
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                prompt={"user_text": user_text, "conversation_context": conversation_context},
+                response={"raw": locals().get("raw"), "parsed": locals().get("parsed")},
+                error=str(exc),
+            )
             logger.exception("Failed to parse Mistral router response: %s", exc)
             return RouterResponse(
                 intent=Intent.COACHING_CHAT,
@@ -451,17 +535,19 @@ class AIEngine:
                 error=str(exc),
             )
             logger.exception("Mistral routing error: %s", exc)
+            reply = (
+                RATE_LIMIT_USER_REPLY
+                if self._is_rate_limit_error(exc)
+                else (
+                    "My coaching brain is taking a quick breather. "
+                    "Try again in a moment — I'm ready when you are."
+                )
+            )
             return RouterResponse(
                 intent=Intent.COACHING_CHAT,
                 payload={},
-                conversational_reply=(
-                    "My coaching brain is taking a quick breather. "
-                    "Try again in a moment — I'm ready when you are."
-                ),
+                conversational_reply=reply,
             )
-        finally:
-            if llm_called:
-                self._throttle_after_llm_call()
 
     def resolve_nutrition_macros(
         self,
@@ -492,19 +578,20 @@ class AIEngine:
             "Choose educated_guess or ask_followup and explain honestly in nutrition_reply. "
             "When use_search, nutrition_reply MUST include the full https URL from Tavily source links."
         )
-        llm_called = False
         started = time.perf_counter()
         try:
-            response = self._client.chat.parse(
-                response_format=NutritionMacrosResponse,
-                model=self._model,
-                messages=[
-                    {"role": "system", "content": NUTRITION_RESOLVE_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.1,
+            response = self._rate_limited_call(
+                "resolve_nutrition_macros",
+                lambda: self._client.chat.parse(
+                    response_format=NutritionMacrosResponse,
+                    model=self._model,
+                    messages=[
+                        {"role": "system", "content": NUTRITION_RESOLVE_SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.1,
+                ),
             )
-            llm_called = True
             parsed = response.choices[0].message.parsed
             if parsed is None:
                 record_llm_call(
@@ -560,9 +647,6 @@ class AIEngine:
             )
             logger.exception("Nutrition macro resolve error: %s", exc)
             return payload
-        finally:
-            if llm_called:
-                self._throttle_after_llm_call()
 
     def answer_research_question(
         self,
@@ -584,19 +668,20 @@ class AIEngine:
             f"Tavily results: {json.dumps(search_result.get('results', []), default=str)[:6000]}\n"
             f"Search error (if any): {search_result.get('error') or 'None'}"
         )
-        llm_called = False
         started = time.perf_counter()
         try:
-            response = self._client.chat.parse(
-                response_format=ResearchResponse,
-                model=self._model,
-                messages=[
-                    {"role": "system", "content": RESEARCH_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.2,
+            response = self._rate_limited_call(
+                "answer_research_question",
+                lambda: self._client.chat.parse(
+                    response_format=ResearchResponse,
+                    model=self._model,
+                    messages=[
+                        {"role": "system", "content": RESEARCH_SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.2,
+                ),
             )
-            llm_called = True
             parsed = response.choices[0].message.parsed
             if parsed is None:
                 record_llm_call(
@@ -627,9 +712,6 @@ class AIEngine:
             )
             logger.exception("Mistral research answer error: %s", exc)
             return draft_reply
-        finally:
-            if llm_called:
-                self._throttle_after_llm_call()
 
     def summarize_health_data(
         self,
@@ -653,19 +735,20 @@ class AIEngine:
             f"Draft reply: {draft_reply}\n"
             f"API data: {serialized}"
         )
-        llm_called = False
         started = time.perf_counter()
         try:
-            response = self._client.chat.parse(
-                response_format=SummaryResponse,
-                model=self._model,
-                messages=[
-                    {"role": "system", "content": SUMMARIZE_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.3,
+            response = self._rate_limited_call(
+                "summarize_health_data",
+                lambda: self._client.chat.parse(
+                    response_format=SummaryResponse,
+                    model=self._model,
+                    messages=[
+                        {"role": "system", "content": SUMMARIZE_SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.3,
+                ),
             )
-            llm_called = True
             parsed = response.choices[0].message.parsed
             if parsed is None:
                 record_llm_call(
@@ -696,6 +779,3 @@ class AIEngine:
             )
             logger.exception("Mistral summarize error: %s", exc)
             return draft_reply
-        finally:
-            if llm_called:
-                self._throttle_after_llm_call()
