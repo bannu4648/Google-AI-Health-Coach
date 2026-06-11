@@ -156,18 +156,70 @@ def _post_message(body: dict[str, Any]) -> dict[str, Any]:
 
 def extract_incoming_text(body: dict[str, Any]) -> tuple[str | None, str | None]:
     """Return (sender_phone, message_text) from a Meta webhook payload."""
+    incoming = extract_incoming_message(body)
+    if not incoming:
+        return None, None
+    if incoming["message_type"] != "text":
+        return incoming["sender"], None
+    return incoming["sender"], incoming.get("text")
+
+
+def extract_incoming_message(body: dict[str, Any]) -> dict[str, Any] | None:
+    """Return normalized inbound message metadata from a Meta webhook payload."""
     try:
         entry = body.get("entry", [])[0]
         change = entry.get("changes", [])[0]
         value = change.get("value", {})
         messages = value.get("messages", [])
         if not messages:
-            return None, None
+            return None
         message = messages[0]
         sender = message.get("from")
-        if message.get("type") != "text":
-            return sender, None
-        text = message.get("text", {}).get("body")
-        return sender, text
+        message_type = message.get("type", "unknown")
+        result: dict[str, Any] = {
+            "sender": sender,
+            "message_type": message_type,
+            "message_id": message.get("id"),
+            "text": None,
+            "media_id": None,
+            "mime_type": None,
+            "caption": "",
+        }
+        if message_type == "text":
+            result["text"] = message.get("text", {}).get("body")
+            return result
+        if message_type == "image":
+            image = message.get("image", {})
+            result["media_id"] = image.get("id")
+            result["mime_type"] = image.get("mime_type", "image/jpeg")
+            result["caption"] = image.get("caption") or ""
+            return result
+        return result
     except (IndexError, KeyError, TypeError):
-        return None, None
+        return None
+
+
+def download_whatsapp_media(media_id: str) -> tuple[bytes, str]:
+    """Download WhatsApp media bytes and mime type via the Cloud API."""
+    if not WHATSAPP_ACCESS_TOKEN:
+        raise RuntimeError("WHATSAPP_ACCESS_TOKEN missing; cannot download media.")
+    meta_url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{media_id}"
+    meta_response = requests.get(
+        meta_url,
+        headers={"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"},
+        timeout=20,
+    )
+    meta_response.raise_for_status()
+    meta = meta_response.json()
+    download_url = meta.get("url")
+    mime_type = meta.get("mime_type", "image/jpeg")
+    if not download_url:
+        raise RuntimeError(f"WhatsApp media metadata missing url for {media_id}")
+
+    file_response = requests.get(
+        download_url,
+        headers={"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"},
+        timeout=30,
+    )
+    file_response.raise_for_status()
+    return file_response.content, mime_type

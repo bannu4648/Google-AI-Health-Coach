@@ -38,9 +38,8 @@ def test_rate_limited_call_retries_then_succeeds(monkeypatch):
 def test_route_message_returns_rate_limit_reply(monkeypatch):
     engine = AIEngine(api_key="test-key", call_delay_seconds=0, rate_limit_max_retries=0)
     engine._client = MagicMock()
-    engine._client.chat.complete.side_effect = FakeRateLimitError("rate limited")
-
-    monkeypatch.setattr(engine, "_wait_for_call_slot", lambda: None)
+    engine._client.generate_json.side_effect = FakeRateLimitError("rate limited")
+    engine._client.model_name = "gemini-2.0-flash"
 
     routed = engine.route_message("summarize my heart rate")
     assert routed.conversational_reply == RATE_LIMIT_USER_REPLY

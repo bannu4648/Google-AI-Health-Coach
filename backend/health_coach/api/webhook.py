@@ -11,7 +11,11 @@ from fastapi.responses import PlainTextResponse
 
 from ..agent.graph import run_coach
 from ..core.database import record_message
-from ..integrations.whatsapp import extract_incoming_text, send_text_message
+from ..integrations.whatsapp import (
+    download_whatsapp_media,
+    extract_incoming_message,
+    send_text_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,24 +39,54 @@ async def verify_webhook(
 async def receive_webhook(request: Request) -> dict[str, Any]:
     """Receive WhatsApp messages, run the coach agent, and send the reply."""
     body = await request.json()
-    sender, user_text = extract_incoming_text(body)
-
-    if not sender:
+    incoming = extract_incoming_message(body)
+    if not incoming or not incoming.get("sender"):
         logger.info("Ignoring webhook without sender/message payload")
         return {"status": "ignored"}
 
-    if not user_text:
-        record_message("inbound", phone=sender, text=None, status="non_text", payload=body)
+    sender = incoming["sender"]
+    message_type = incoming.get("message_type", "unknown")
+
+    if message_type == "text":
+        user_text = incoming.get("text") or ""
+        logger.info("Incoming text from %s: %s", sender, user_text)
+        record_message("inbound", phone=sender, text=user_text, status="received", payload=body)
+        result = run_coach(user_text=user_text, sender_phone=sender, message_type="text")
+    elif message_type == "image":
+        media_id = incoming.get("media_id")
+        caption = incoming.get("caption") or ""
+        logger.info("Incoming image from %s (caption=%r, media_id=%s)", sender, caption, media_id)
+        record_message(
+            "inbound",
+            phone=sender,
+            text=caption or "[image]",
+            status="received_image",
+            payload=body,
+        )
+        try:
+            image_bytes, mime_type = download_whatsapp_media(media_id)
+        except Exception as exc:
+            logger.exception("Failed to download WhatsApp image: %s", exc)
+            send_text_message(
+                sender,
+                "I couldn't download that photo. Please try sending it again.",
+            )
+            return {"status": "image_download_failed"}
+        result = run_coach(
+            user_text=caption,
+            sender_phone=sender,
+            message_type="image",
+            image_bytes=image_bytes,
+            image_mime_type=mime_type,
+            image_caption=caption,
+        )
+    else:
+        record_message("inbound", phone=sender, text=None, status="unsupported_type", payload=body)
         send_text_message(
             sender,
-            "I can currently understand text messages only. Send me a meal, metric, or question.",
+            "I can handle text and food photos right now. Send a meal photo or describe what you ate.",
         )
         return {"status": "ignored_non_text"}
-
-    logger.info("Incoming message from %s: %s", sender, user_text)
-    record_message("inbound", phone=sender, text=user_text, status="received", payload=body)
-
-    result = run_coach(user_text=user_text, sender_phone=sender)
     final_reply = result.get("final_reply") or result.get("conversational_reply") or (
         "I heard you, but I could not produce a coach reply just now."
     )

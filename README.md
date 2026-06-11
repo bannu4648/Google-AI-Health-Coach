@@ -1,6 +1,6 @@
 # WhatsApp AI Health Coach
 
-A local, open-source WhatsApp health coach that turns natural-language messages into structured health actions. It routes requests through **Mistral**, reads and writes data via the **Google Health API v4**, looks up nutrition from trusted web sources with **Tavily**, and ships with a **React observability dashboard**.
+A local, open-source WhatsApp health coach that turns natural-language messages and **food photos** into structured health actions. It uses a **multi-agent LangGraph** workflow with **Google Gemini** (vision + routing), reads and writes data via the **Google Health API v4**, looks up nutrition from trusted web sources with **Tavily**, and ships with a **React observability dashboard**.
 
 Built for personal, single-user use: FastAPI on your machine, `ngrok` for the webhook, Google OAuth in the browser, and all times interpreted in **Hong Kong time (HKT)** by default.
 
@@ -109,32 +109,30 @@ Copy `.env.example` to `.env` and fill in your keys:
 cp .env.example .env
 ```
 
-Required: `MISTRAL_API_KEY`, `WHATSAPP_*`, `TAVILY_API_KEY` (free at [tavily.com](https://tavily.com))
+Required: `GEMINI_API_KEY`, `WHATSAPP_*`, `TAVILY_API_KEY` (free at [tavily.com](https://tavily.com))
 
-### LLM provider (Mistral)
+### LLM provider (Google Gemini)
 
-The agent uses **[Mistral](https://mistral.ai/)** for all language-model steps: intent routing, nutrition macro resolution, Google Health summarization, and Tavily-backed research answers. Create an API key at [console.mistral.ai](https://console.mistral.ai/) and set `MISTRAL_API_KEY` in `.env`. The default model is `mistral-large-latest` (`MISTRAL_MODEL`).
+The multi-agent coach uses **[Google Gemini](https://aistudio.google.com/)** for vision, intent routing, nutrition macro resolution, Google Health summarization, and Tavily-backed research answers. Create a free API key at [aistudio.google.com/apikey](https://aistudio.google.com/apikey) and set `GEMINI_API_KEY` in `.env`. Default model: `gemini-2.5-flash` (`GEMINI_MODEL`).
 
-Each WhatsApp message can trigger multiple Mistral calls (for example, route + summarize on a heart-rate query). Rate-limit handling is built in:
+**Multi-agent flow:**
+- **Vision agent** — analyzes WhatsApp food photos (`agent/vision.py`)
+- **Router agent** — text intent + payload (`agent/engine.py`)
+- **Nutrition agent** — Tavily lookup + macro resolution
+- **Research agent** — sourced general wellness Q&A
+- **Health sync + summarizer** — Google Health API + coach reply
+
+Send a meal photo on WhatsApp — by default the vision agent identifies the food and returns nutrition info **without logging**. Add a caption like `log this` or `save to my app` if you want it written to Google Health.
+
+Rate-limit handling:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `MISTRAL_CALL_DELAY_SECONDS` | `2` | Minimum spacing before and after each Mistral call |
-| `MISTRAL_RATE_LIMIT_MAX_RETRIES` | `3` | Retries when Mistral returns HTTP 429 |
-| `MISTRAL_RATE_LIMIT_BACKOFF_SECONDS` | `2` | Base delay for exponential backoff (2s → 4s → 8s) |
+| `GEMINI_CALL_DELAY_SECONDS` | `2` | Minimum spacing before and after each Gemini call |
+| `GEMINI_RATE_LIMIT_MAX_RETRIES` | `3` | Retries on HTTP 429 / quota errors |
+| `GEMINI_RATE_LIMIT_BACKOFF_SECONDS` | `2` | Base delay for exponential backoff (2s → 4s → 8s) |
 
-If you still hit limits on a free tier, increase `MISTRAL_CALL_DELAY_SECONDS` to `3`–`5`.
-
-**Swapping or adding models (Gemini, OpenAI, etc.)**
-
-Mistral is the default, but the design is provider-agnostic. All LLM logic lives in `backend/health_coach/agent/engine.py` inside `AIEngine`, which exposes four methods used by the LangGraph workflow:
-
-- `route_message` — JSON intent + payload
-- `resolve_nutrition_macros` — structured macro resolution from Tavily results
-- `summarize_health_data` — coach reply from normalized Google Health JSON
-- `answer_research_question` — sourced general wellness answers
-
-Prompts and Pydantic response schemas are not tied to Mistral. To use **Gemini**, **OpenAI**, or another provider, implement the same four methods (subclass `AIEngine` or extract a small protocol) and wire your client in `build_coach_graph()` in `graph.py`. Any model that supports JSON / structured output works.
+If you hit free-tier limits, increase `GEMINI_CALL_DELAY_SECONDS` to `3`–`5`.
 
 ### 3. Google OAuth credentials
 

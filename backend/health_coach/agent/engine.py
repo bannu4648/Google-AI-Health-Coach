@@ -1,46 +1,39 @@
 """
-Mistral-powered intent router and conversational parser for the health coach bot.
+Gemini-powered multi-agent LLM facade for the health coach bot.
+
+Specialist agents:
+- Router (this module) — intent routing and summarization
+- Vision (agent/vision.py) — food photo analysis
+- Nutrition / research — resolved via Tavily + Gemini structured output
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
-import threading
 import time
-from collections.abc import Callable
 from enum import Enum
-from typing import Any, TypeVar
+from typing import Any
 
 from dotenv import load_dotenv
-from mistralai.client import Mistral
-from mistralai.client.errors import MistralError
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from ..core.types import DATA_TYPE_PROMPT_LIST, normalize_query_payload
 from ..core.database import record_llm_call
 from ..core.timezone import llm_time_context
+from ..integrations.gemini_client import (
+    GEMINI_CALL_DELAY_SECONDS,
+    GEMINI_MODEL,
+    GEMINI_RATE_LIMIT_BACKOFF_SECONDS,
+    GEMINI_RATE_LIMIT_MAX_RETRIES,
+    RATE_LIMIT_USER_REPLY,
+    GeminiClient,
+)
 from ..integrations.nutrition import search_has_usable_results
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
-
-MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-large-latest")
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
-MISTRAL_CALL_DELAY_SECONDS = float(os.getenv("MISTRAL_CALL_DELAY_SECONDS", "2"))
-MISTRAL_RATE_LIMIT_MAX_RETRIES = int(os.getenv("MISTRAL_RATE_LIMIT_MAX_RETRIES", "3"))
-MISTRAL_RATE_LIMIT_BACKOFF_SECONDS = float(
-    os.getenv("MISTRAL_RATE_LIMIT_BACKOFF_SECONDS", "2")
-)
-
-T = TypeVar("T")
-
-RATE_LIMIT_USER_REPLY = (
-    "Mistral's API rate limit was hit — I've queued a short pause and will be ready "
-    "again in a few seconds. Please resend your message."
-)
 
 
 class Intent(str, Enum):
@@ -355,108 +348,47 @@ Rules:
 
 
 class AIEngine:
-    """Routes natural-language messages to structured intents via Mistral JSON mode."""
-
-    _last_call_at: float = 0.0
-    _call_lock = threading.Lock()
+    """Routes natural-language messages to structured intents via Gemini JSON mode."""
 
     def __init__(
         self,
         api_key: str | None = None,
-        model_name: str = MISTRAL_MODEL,
+        model_name: str = GEMINI_MODEL,
         call_delay_seconds: float | None = None,
         rate_limit_max_retries: int | None = None,
         rate_limit_backoff_seconds: float | None = None,
     ):
-        key = api_key or MISTRAL_API_KEY
-        if not key:
-            raise ValueError("Set MISTRAL_API_KEY in your .env file.")
-        self._client = Mistral(api_key=key)
-        self._model = model_name
-        self._call_delay_seconds = (
-            MISTRAL_CALL_DELAY_SECONDS
-            if call_delay_seconds is None
-            else call_delay_seconds
+        self._client = GeminiClient(
+            api_key=api_key,
+            model_name=model_name,
+            call_delay_seconds=call_delay_seconds
+            if call_delay_seconds is not None
+            else GEMINI_CALL_DELAY_SECONDS,
+            rate_limit_max_retries=rate_limit_max_retries
+            if rate_limit_max_retries is not None
+            else GEMINI_RATE_LIMIT_MAX_RETRIES,
+            rate_limit_backoff_seconds=rate_limit_backoff_seconds
+            if rate_limit_backoff_seconds is not None
+            else GEMINI_RATE_LIMIT_BACKOFF_SECONDS,
         )
-        self._rate_limit_max_retries = (
-            MISTRAL_RATE_LIMIT_MAX_RETRIES
-            if rate_limit_max_retries is None
-            else rate_limit_max_retries
-        )
-        self._rate_limit_backoff_seconds = (
-            MISTRAL_RATE_LIMIT_BACKOFF_SECONDS
-            if rate_limit_backoff_seconds is None
-            else rate_limit_backoff_seconds
-        )
+        self._model = self._client.model_name
 
     @property
     def call_delay_seconds(self) -> float:
-        return self._call_delay_seconds
+        return self._client._call_delay_seconds
 
     @staticmethod
     def _is_rate_limit_error(exc: BaseException) -> bool:
-        if isinstance(exc, MistralError) and exc.status_code == 429:
-            return True
-        message = str(exc).lower()
-        return "429" in message or "rate limit" in message
+        return GeminiClient._is_rate_limit_error(exc)
 
     def _wait_for_call_slot(self) -> None:
-        """Ensure a minimum gap between Mistral calls (shared across requests)."""
-        if self._call_delay_seconds <= 0:
-            return
-        with self._call_lock:
-            elapsed = time.monotonic() - AIEngine._last_call_at
-            remaining = self._call_delay_seconds - elapsed
-            if remaining > 0:
-                logger.info(
-                    "Waiting %.1fs before Mistral call (rate spacing).",
-                    remaining,
-                )
-                time.sleep(remaining)
-
-    def _mark_call_completed(self) -> None:
-        with self._call_lock:
-            AIEngine._last_call_at = time.monotonic()
+        self._client._wait_for_call_slot()
 
     def _throttle_after_llm_call(self) -> None:
-        """Pause after each Mistral API call to reduce rate-limit pressure."""
-        if self._call_delay_seconds <= 0:
-            return
-        logger.info(
-            "Throttling %.1fs after Mistral call.",
-            self._call_delay_seconds,
-        )
-        time.sleep(self._call_delay_seconds)
-        self._mark_call_completed()
+        self._client._throttle_after_call()
 
-    def _rate_limited_call(self, purpose: str, call: Callable[[], T]) -> T:
-        """Space Mistral calls and retry transient HTTP 429 rate limits."""
-        self._wait_for_call_slot()
-        last_exc: BaseException | None = None
-        for attempt in range(self._rate_limit_max_retries + 1):
-            try:
-                result = call()
-                self._throttle_after_llm_call()
-                return result
-            except Exception as exc:
-                last_exc = exc
-                if (
-                    self._is_rate_limit_error(exc)
-                    and attempt < self._rate_limit_max_retries
-                ):
-                    wait = self._rate_limit_backoff_seconds * (2**attempt)
-                    logger.warning(
-                        "Mistral rate limit during %s (attempt %d/%d); retrying in %.1fs.",
-                        purpose,
-                        attempt + 1,
-                        self._rate_limit_max_retries,
-                        wait,
-                    )
-                    time.sleep(wait)
-                    continue
-                raise
-        assert last_exc is not None
-        raise last_exc
+    def _rate_limited_call(self, purpose: str, call):
+        return self._client._rate_limited_call(purpose, call)
 
     def route_message(
         self,
@@ -477,20 +409,12 @@ class AIEngine:
 
         started = time.perf_counter()
         try:
-            response = self._rate_limited_call(
-                "route_message",
-                lambda: self._client.chat.complete(
-                    model=self._model,
-                    messages=[
-                        {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                    response_format={"type": "json_object"},
-                    temperature=0.2,
-                ),
+            parsed = self._client.generate_json(
+                purpose="route_message",
+                system_prompt=ROUTER_SYSTEM_PROMPT,
+                user_prompt=prompt,
+                temperature=0.2,
             )
-            raw = response.choices[0].message.content or "{}"
-            parsed = json.loads(raw)
             routed = RouterResponse.model_validate(parsed)
             if routed.payload and routed.intent in GOOGLE_HEALTH_QUERY_INTENTS:
                 routed.payload = normalize_query_payload(
@@ -515,7 +439,7 @@ class AIEngine:
                 response={"raw": locals().get("raw"), "parsed": locals().get("parsed")},
                 error=str(exc),
             )
-            logger.exception("Failed to parse Mistral router response: %s", exc)
+            logger.exception("Failed to parse Gemini router response: %s", exc)
             return RouterResponse(
                 intent=Intent.COACHING_CHAT,
                 payload={},
@@ -534,7 +458,7 @@ class AIEngine:
                 prompt={"user_text": user_text, "conversation_context": conversation_context},
                 error=str(exc),
             )
-            logger.exception("Mistral routing error: %s", exc)
+            logger.exception("Gemini routing error: %s", exc)
             reply = (
                 RATE_LIMIT_USER_REPLY
                 if self._is_rate_limit_error(exc)
@@ -580,19 +504,13 @@ class AIEngine:
         )
         started = time.perf_counter()
         try:
-            response = self._rate_limited_call(
-                "resolve_nutrition_macros",
-                lambda: self._client.chat.parse(
-                    response_format=NutritionMacrosResponse,
-                    model=self._model,
-                    messages=[
-                        {"role": "system", "content": NUTRITION_RESOLVE_SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0.1,
-                ),
+            parsed = self._client.generate_structured(
+                purpose="resolve_nutrition_macros",
+                system_prompt=NUTRITION_RESOLVE_SYSTEM_PROMPT,
+                user_prompt=prompt,
+                response_model=NutritionMacrosResponse,
+                temperature=0.1,
             )
-            parsed = response.choices[0].message.parsed
             if parsed is None:
                 record_llm_call(
                     purpose="resolve_nutrition_macros",
@@ -670,19 +588,13 @@ class AIEngine:
         )
         started = time.perf_counter()
         try:
-            response = self._rate_limited_call(
-                "answer_research_question",
-                lambda: self._client.chat.parse(
-                    response_format=ResearchResponse,
-                    model=self._model,
-                    messages=[
-                        {"role": "system", "content": RESEARCH_SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0.2,
-                ),
+            parsed = self._client.generate_structured(
+                purpose="answer_research_question",
+                system_prompt=RESEARCH_SYSTEM_PROMPT,
+                user_prompt=prompt,
+                response_model=ResearchResponse,
+                temperature=0.2,
             )
-            parsed = response.choices[0].message.parsed
             if parsed is None:
                 record_llm_call(
                     purpose="answer_research_question",
@@ -710,7 +622,7 @@ class AIEngine:
                 prompt={"user_text": user_text, "draft_reply": draft_reply, "search_result": search_result},
                 error=str(exc),
             )
-            logger.exception("Mistral research answer error: %s", exc)
+            logger.exception("Gemini research answer error: %s", exc)
             return draft_reply
 
     def summarize_health_data(
@@ -737,19 +649,13 @@ class AIEngine:
         )
         started = time.perf_counter()
         try:
-            response = self._rate_limited_call(
-                "summarize_health_data",
-                lambda: self._client.chat.parse(
-                    response_format=SummaryResponse,
-                    model=self._model,
-                    messages=[
-                        {"role": "system", "content": SUMMARIZE_SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0.3,
-                ),
+            parsed = self._client.generate_structured(
+                purpose="summarize_health_data",
+                system_prompt=SUMMARIZE_SYSTEM_PROMPT,
+                user_prompt=prompt,
+                response_model=SummaryResponse,
+                temperature=0.3,
             )
-            parsed = response.choices[0].message.parsed
             if parsed is None:
                 record_llm_call(
                     purpose="summarize_health_data",
@@ -777,5 +683,5 @@ class AIEngine:
                 prompt={"user_text": user_text, "draft_reply": draft_reply, "api_result": api_result},
                 error=str(exc),
             )
-            logger.exception("Mistral summarize error: %s", exc)
+            logger.exception("Gemini summarize error: %s", exc)
             return draft_reply
