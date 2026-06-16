@@ -6,6 +6,7 @@ from datetime import datetime, time, timedelta, timezone
 from typing import Any
 
 from ..agent.engine import AIEngine
+from .user_profile import fetch_user_profile_snapshot, format_user_profile_for_prompt
 from ..core.database import add_coach_note, upsert_daily_summary
 from ..core.timezone import (
     enrich_health_api_result_for_llm,
@@ -14,6 +15,14 @@ from ..core.timezone import (
     local_date_str,
     now_local,
 )
+from ..services.fitness_plans import (
+    format_workout_for_reply,
+    get_relevant_active_plan,
+    get_todays_workout,
+    plan_adherence_summary,
+)
+from ..services.user_goals import fetch_active_goals, format_goals_for_reply
+from ..services.goal_progress import format_goal_progress_for_summary
 from ..integrations.google_health import GoogleHealthAPIError, GoogleHealthClient
 
 WEEKLY_LOOKBACK_DAYS = 7
@@ -82,6 +91,66 @@ def _rollup_daily_series(
             }
         )
     return series
+
+
+def _minutes_between_times(start: str | None, end: str | None) -> int | None:
+    if not start or not end:
+        return None
+    try:
+        from ..core.timezone import parse_to_utc
+
+        seconds = (parse_to_utc(end) - parse_to_utc(start)).total_seconds()
+    except (TypeError, ValueError):
+        return None
+    return int(round(seconds / 60)) if seconds >= 0 else None
+
+
+def _extract_sleep_metrics(sleep_items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate duration and stage minutes from raw sleep data points."""
+    total_duration = 0
+    rem_minutes = 0
+    deep_minutes = 0
+    light_minutes = 0
+    for point in sleep_items:
+        sleep = point.get("sleep", {})
+        interval = sleep.get("interval", {})
+        duration = _minutes_between_times(interval.get("startTime"), interval.get("endTime"))
+        if duration:
+            total_duration += duration
+        for stage in sleep.get("stages", []):
+            stage_type = str(stage.get("type", "")).lower()
+            stage_mins = _minutes_between_times(stage.get("startTime"), stage.get("endTime")) or 0
+            if "rem" in stage_type:
+                rem_minutes += stage_mins
+            elif "deep" in stage_type:
+                deep_minutes += stage_mins
+            elif "light" in stage_type or "core" in stage_type:
+                light_minutes += stage_mins
+    hours = round(total_duration / 60, 1) if total_duration else None
+    return {
+        "session_count": len(sleep_items),
+        "duration_minutes": total_duration,
+        "duration_hours": hours,
+        "rem_minutes": rem_minutes,
+        "deep_minutes": deep_minutes,
+        "light_minutes": light_minutes,
+    }
+
+
+def _extract_resting_hr_bpm(rhr_result: dict[str, Any]) -> int | None:
+    points = rhr_result.get("dataPoints", [])
+    for point in points:
+        rhr = point.get("dailyRestingHeartRate", {})
+        bpm = rhr.get("beatsPerMinute")
+        if bpm is not None:
+            return int(bpm)
+    return None
+
+
+def _extract_active_zone_minutes(azm_raw: dict[str, Any]) -> int:
+    if not azm_raw:
+        return 0
+    return int(azm_raw.get("minutesSum", 0) or azm_raw.get("minutes_sum", 0) or 0)
 
 
 def _count_data_points_by_day(items: list[dict[str, Any]]) -> dict[str, int]:
@@ -186,13 +255,18 @@ def _fetch_range_metrics(
     sleep_items = sleep_result.get("dataPoints", [])
     meal_items = meals_result.get("dataPoints", [])
 
+    sleep_metrics = _extract_sleep_metrics(sleep_items)
+    rhr_bpm = _extract_resting_hr_bpm(rhr_result)
+    azm_minutes = _extract_active_zone_minutes(metrics.get("active_zone_minutes", {}).get("raw", {}))
+
     metrics["exercise"] = {"count": len(exercise_items), "items": exercise_items}
-    metrics["sleep"] = {"count": len(sleep_items), "items": sleep_items}
+    metrics["sleep"] = {"count": len(sleep_items), "items": sleep_items, **sleep_metrics}
     metrics["heart_rate"] = {
         "sample_count": len(heart_result.get("dataPoints", [])),
         "items": heart_result.get("dataPoints", [])[:10],
     }
-    metrics["resting_heart_rate"] = rhr_result
+    metrics["resting_heart_rate"] = {"bpm": rhr_bpm, "raw": rhr_result}
+    metrics["active_zone_minutes"]["total"] = azm_minutes
     metrics["nutrition"] = {"count": len(meal_items), "items": meal_items}
     return metrics
 
@@ -319,6 +393,7 @@ def get_morning_health_snapshot(*, client: GoogleHealthClient | None = None) -> 
         end_time=sleep_end,
     )
     sleep_items = last_night_sleep.get("dataPoints", [])
+    sleep_metrics = _extract_sleep_metrics(sleep_items)
 
     weekly = get_weekly_health_trends(client=health)
     today = get_daily_health_snapshot(client=health)
@@ -331,6 +406,7 @@ def get_morning_health_snapshot(*, client: GoogleHealthClient | None = None) -> 
             "range_utc": {"start": sleep_start, "end": sleep_end},
             "count": len(sleep_items),
             "items": sleep_items,
+            **sleep_metrics,
         },
         "weekly_trends": weekly,
         "today_so_far": {
@@ -350,25 +426,61 @@ def readiness_score(snapshot: dict[str, Any]) -> dict[str, Any]:
 
     steps = snapshot.get("steps", {}).get("count", 0)
     exercises = snapshot.get("exercise", {}).get("count", 0)
-    sleep_count = snapshot.get("sleep", {}).get("count", 0)
+    sleep = snapshot.get("sleep", {})
+    sleep_hours = sleep.get("duration_hours")
+    sleep_count = sleep.get("count", 0)
+    azm = snapshot.get("active_zone_minutes", {}).get("total", 0)
+    rhr = snapshot.get("resting_heart_rate", {}).get("bpm")
+    meals = snapshot.get("nutrition", {}).get("count", 0)
 
-    if sleep_count == 0:
+    if sleep_count == 0 or not sleep_hours:
+        score -= 12
+        reasons.append("No sleep data yet — recovery guidance is less certain.")
+    elif sleep_hours < 6:
         score -= 10
-        reasons.append("No sleep data is available yet, so recovery confidence is lower.")
-    else:
+        reasons.append(f"Sleep was {sleep_hours}h — consider an earlier wind-down tonight.")
+    elif sleep_hours >= 7.5:
         score += 10
-        reasons.append("Sleep data is available, so recovery guidance can be more personalized.")
+        reasons.append(f"Solid sleep at {sleep_hours}h supports recovery.")
+    else:
+        score += 4
+        reasons.append(f"Sleep was {sleep_hours}h — decent but room to improve.")
+
+    deep = sleep.get("deep_minutes", 0)
+    if deep and deep >= 60:
+        score += 4
+        reasons.append(f"Deep sleep was {deep} min — good physical recovery signal.")
+    elif deep and deep < 30 and sleep_count:
+        score -= 3
+        reasons.append("Deep sleep was light — keep today moderate.")
+
+    if azm >= 30:
+        score -= 4
+        reasons.append(f"Active zone minutes are high today ({azm} min) — factor in fatigue.")
+    elif azm >= 15:
+        score += 2
+
+    if rhr is not None:
+        if rhr > 75:
+            score -= 4
+            reasons.append(f"Resting HR is elevated ({rhr} bpm) — recovery may be incomplete.")
+        elif rhr <= 60:
+            score += 3
 
     if steps >= 10000:
-        score += 8
-        reasons.append("You reached a strong step volume today.")
+        score += 6
+        reasons.append(f"Strong step volume today ({steps:,}).")
     elif steps < 4000:
-        score -= 8
-        reasons.append("Step volume is on the lighter side today.")
+        score -= 6
+        reasons.append(f"Steps are light today ({steps:,}).")
 
     if exercises:
-        score += 6
+        score += 4
         reasons.append("A workout was logged today.")
+
+    if meals == 0:
+        score -= 2
+        reasons.append("No meals logged yet — nutrition feedback is limited.")
 
     score = max(0, min(100, score))
     if score >= 80:
@@ -384,28 +496,55 @@ def morning_readiness_score(snapshot: dict[str, Any]) -> dict[str, Any]:
     score = 70
     reasons: list[str] = []
 
-    sleep_count = snapshot.get("last_night_sleep", {}).get("count", 0)
+    last_night = snapshot.get("last_night_sleep", {})
+    sleep_hours = last_night.get("duration_hours")
+    sleep_count = last_night.get("count", 0)
     weekly = snapshot.get("weekly_trends", {})
     avg_steps = weekly.get("steps", {}).get("average_on_active_days", 0)
     workout_total = weekly.get("exercise", {}).get("total_sessions", 0)
+    azm_daily = weekly.get("active_zone_minutes", {}).get("daily", [])
+    avg_azm = 0
+    if azm_daily:
+        values = [int(row.get("value", 0) or 0) for row in azm_daily]
+        avg_azm = int(sum(values) / len(values)) if values else 0
 
-    if sleep_count == 0:
+    if sleep_count == 0 or not sleep_hours:
+        score -= 14
+        reasons.append("No sleep data from last night — recovery guidance is uncertain.")
+    elif sleep_hours < 6:
         score -= 12
-        reasons.append("No sleep data from last night yet — recovery guidance is less certain.")
-    else:
+        reasons.append(f"Last night was only {sleep_hours}h — plan a lighter day.")
+    elif sleep_hours >= 7.5:
         score += 12
-        reasons.append("Last night's sleep data is available for recovery planning.")
+        reasons.append(f"Last night's {sleep_hours}h sleep supports a productive day.")
+    else:
+        score += 5
+        reasons.append(f"Last night: {sleep_hours}h sleep — okay, not optimal.")
+
+    rem = last_night.get("rem_minutes", 0)
+    if rem and rem >= 90:
+        score += 3
+        reasons.append(f"REM sleep was {rem} min — cognitive recovery looks good.")
+    elif rem and rem < 45 and sleep_count:
+        score -= 3
+        reasons.append("REM was short — expect lower focus early today.")
+
+    if avg_azm >= 25:
+        score -= 4
+        reasons.append(f"Weekly strain is elevated (~{avg_azm} AZM/day) — prioritize recovery.")
+    elif avg_azm and avg_azm < 10:
+        score += 2
 
     if avg_steps >= 8000:
         score += 6
-        reasons.append("Weekly step volume has been solid.")
+        reasons.append(f"Weekly steps averaging {avg_steps:,} — solid baseline.")
     elif avg_steps and avg_steps < 5000:
         score -= 6
-        reasons.append("Weekly step volume has been on the lighter side.")
+        reasons.append(f"Weekly steps averaging {avg_steps:,} — below target.")
 
     if workout_total >= 3:
         score += 4
-        reasons.append("You have been active across the week.")
+        reasons.append(f"{workout_total} workouts logged this week.")
     elif workout_total == 0:
         score -= 4
         reasons.append("No workouts logged this week yet.")
@@ -464,43 +603,95 @@ def morning_recommendations(snapshot: dict[str, Any]) -> list[str]:
     return recs
 
 
-def build_daily_coach_message(summary_type: str, snapshot: dict[str, Any]) -> str:
+def _coach_adherence_context() -> dict[str, Any]:
+    plan = get_relevant_active_plan()
+    goals = fetch_active_goals(limit=3)
+    context: dict[str, Any] = {"goals": goals}
+    if plan:
+        context["plan_adherence"] = plan_adherence_summary(plan)
+        context["plan_week"] = plan.get("week_start_hkt")
+    return context
+
+
+def build_daily_coach_message(
+    summary_type: str,
+    snapshot: dict[str, Any],
+    *,
+    client: GoogleHealthClient | None = None,
+) -> str:
+    adherence = _coach_adherence_context()
+    plan_line = ""
+    if adherence.get("plan_adherence"):
+        pa = adherence["plan_adherence"]
+        plan_line = f" {pa.get('label', '')}."
+    goals_line = ""
+    if adherence.get("goals"):
+        goals_line = f" Active goals: {len(adherence['goals'])}."
+
     if summary_type == "evening":
         draft = (
             f"Evening recap for {snapshot['date_hkt']}: "
             f"{snapshot['steps']['count']} steps, {snapshot['exercise']['count']} workouts, "
             f"{snapshot['nutrition']['count']} meals logged today. "
             f"Readiness is {snapshot['readiness']['score']}/100 ({snapshot['readiness']['label']})."
+            f"{plan_line}{goals_line}"
         )
         user_text = (
             "Create an evening recap for TODAY only. Summarize today's steps, workouts, "
             "meals, hydration, and heart-rate activity. Reflect on what went well and "
             "give practical sleep-prep advice for tonight. Do not discuss multi-day trends."
         )
+        if adherence.get("plan_adherence"):
+            pa = adherence["plan_adherence"]
+            user_text += f" Fitness plan status: {pa.get('label', '')}."
+        if adherence.get("goals"):
+            user_text += f" Active goals summary: {format_goals_for_reply(adherence['goals'])}"
+        goal_progress = format_goal_progress_for_summary(adherence.get("goals"), snapshot=snapshot, client=client)
+        if goal_progress:
+            user_text += f" Goal progress today: {goal_progress}."
     else:
         weekly = snapshot.get("weekly_trends", {})
         last_night = snapshot.get("last_night_sleep", {})
+        today_workout = get_todays_workout()
+        workout_line = ""
+        if today_workout:
+            workout_line = f" Today's planned workout: {today_workout.get('title')}."
         draft = (
             f"Morning briefing for {snapshot['date_hkt']}: "
             f"last night {last_night.get('count', 0)} sleep session(s); "
             f"7-day avg steps {weekly.get('steps', {}).get('average_on_active_days', 0)}; "
-            f"{weekly.get('exercise', {}).get('total_sessions', 0)} workouts this week. "
+            f"{weekly.get('exercise', {}).get('total_sessions', 0)} workouts this week.{workout_line} "
             f"Readiness is {snapshot['readiness']['score']}/100 ({snapshot['readiness']['label']})."
+            f"{plan_line}{goals_line}"
         )
         user_text = (
             "Create a morning proactive health coach message. Lead with last night's sleep "
             "(duration/quality if available). Then summarize the past week's activity, sleep, "
-            "meals, and hydration trends. End with clear, actionable suggestions for what to "
-            "focus on TODAY."
+            "meals, and hydration trends."
         )
+        if adherence.get("plan_adherence"):
+            pa = adherence["plan_adherence"]
+            user_text += f" Include fitness plan status: {pa.get('label', '')}."
+        if adherence.get("goals"):
+            user_text += f" Mention top goals: {format_goals_for_reply(adherence['goals'])}"
+        if today_workout:
+            user_text += (
+                f" Include today's planned workout with steps: {format_workout_for_reply(today_workout)}"
+            )
+        user_text += " End with clear, actionable suggestions for what to focus on TODAY."
 
     llm_payload = enrich_health_api_result_for_llm(snapshot)
+    llm_payload["coach_adherence"] = adherence
     try:
         engine = AIEngine()
+        profile_context = format_user_profile_for_prompt(
+            fetch_user_profile_snapshot(client=client)
+        )
         return engine.summarize_health_data(
             user_text=user_text,
             draft_reply=draft,
             api_result=llm_payload,
+            user_profile_context=profile_context,
         )
     except Exception:
         return draft + " " + " ".join(snapshot.get("recommendations", [])[:2])
@@ -512,7 +703,7 @@ def create_daily_summary(summary_type: str, *, client: GoogleHealthClient | None
     else:
         snapshot = get_morning_health_snapshot(client=client)
 
-    message = build_daily_coach_message(summary_type, snapshot)
+    message = build_daily_coach_message(summary_type, snapshot, client=client)
     upsert_daily_summary(
         snapshot.get("date_hkt") or local_date_str(),
         summary_type=summary_type,
@@ -526,3 +717,47 @@ def create_daily_summary(summary_type: str, *, client: GoogleHealthClient | None
         payload=snapshot,
     )
     return {"snapshot": snapshot, "message": message}
+
+
+def build_weekly_recap_message(*, client: GoogleHealthClient | None = None) -> dict[str, Any]:
+    """7-day rollup + LLM-polished recap for Sunday evening."""
+    health = client or GoogleHealthClient()
+    weekly = get_weekly_health_trends(client=health)
+    adherence = _coach_adherence_context()
+    goals = fetch_active_goals(limit=5)
+    plan = adherence.get("plan_adherence") or {}
+    avg_steps = weekly.get("steps", {}).get("average_on_active_days", 0)
+    workouts = weekly.get("exercise", {}).get("total_sessions", 0)
+    sleep_days = len(weekly.get("sleep", {}).get("by_day", {}))
+    meal_days = len(weekly.get("nutrition", {}).get("by_day", {}))
+    draft = (
+        f"Week in review: avg {avg_steps:,} steps/day, {workouts} workouts, "
+        f"sleep logged {sleep_days}/7 nights, meals logged {meal_days}/7 days."
+    )
+    if plan:
+        draft += f" Plan: {plan.get('label', '')}."
+    user_text = (
+        "Write a warm Sunday evening weekly health recap for WhatsApp. "
+        "Include steps average, workouts, sleep and meal logging consistency, "
+        "fitness plan adherence, and one focus for next week. Under 900 chars."
+    )
+    if goals:
+        user_text += f" Goals: {format_goals_for_reply(goals)}"
+    llm_payload = enrich_health_api_result_for_llm({"weekly_trends": weekly, "coach_adherence": adherence})
+    try:
+        engine = AIEngine()
+        profile_context = format_user_profile_for_prompt(fetch_user_profile_snapshot(client=health))
+        message = engine.summarize_health_data(
+            user_text=user_text,
+            draft_reply=draft,
+            api_result=llm_payload,
+            user_profile_context=profile_context,
+        )
+    except Exception:
+        message = draft
+    add_coach_note("weekly_recap", message[:200], source="scheduler", payload=weekly)
+    return {"weekly": weekly, "message": message, "adherence": adherence}
+
+
+def create_weekly_recap(*, client: GoogleHealthClient | None = None) -> dict[str, Any]:
+    return build_weekly_recap_message(client=client)

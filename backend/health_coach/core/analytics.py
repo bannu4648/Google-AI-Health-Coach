@@ -101,15 +101,35 @@ def _sanitize_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
 
 
 def health_overview() -> dict[str, Any]:
+    from ..services.coach_state import build_coach_state_snapshot
+    from ..services.coaching_preferences import get_coaching_focus
+    from ..services.scheduler import get_scheduler_config
+
     summary = _latest_daily_summary()
     snapshot = summary.get("metrics", {}) if summary else {}
     actions = recent_table("health_actions", limit=10)
     messages = recent_table("messages", limit=10)
     notes = recent_table("coach_notes", limit=5)
+    coach_state = build_coach_state_snapshot()
+    scheduler = get_scheduler_config()
     return {
         **_sanitize_snapshot(snapshot),
         "coach_message": summary.get("message") if summary else "",
         "summary_type": summary.get("summary_type") if summary else None,
+        "coaching_panel": {
+            "coaching_focus": get_coaching_focus(),
+            "goals": coach_state.get("goals", []),
+            "plan_adherence": coach_state.get("plan_adherence"),
+            "plan_summary": coach_state.get("plan_summary", ""),
+            "next_nudges": {
+                "morning_summary": scheduler.get("morning_summary_time"),
+                "evening_summary": scheduler.get("evening_summary_time"),
+                "readiness_nudge": scheduler.get("readiness_nudge_time") or None,
+                "workout_nudge": scheduler.get("workout_nudge_time"),
+                "weekly_recap": f"{scheduler.get('weekly_recap_day')} {scheduler.get('weekly_recap_time')}",
+            },
+            "scheduler_enabled": scheduler.get("enabled") == "true",
+        },
         "recent_activity": [
             {
                 "created_at": row.get("created_at"),

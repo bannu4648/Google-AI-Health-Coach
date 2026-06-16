@@ -63,6 +63,40 @@ export function OverviewTab({
       </div>
 
       <div className="grid">
+        <Card title="Coaching Focus">
+          <p className="coach-message">
+            {health?.coaching_panel?.coaching_focus || "No multi-day focus set yet."}
+          </p>
+          <p className="muted">
+            Scheduler: {health?.coaching_panel?.scheduler_enabled ? "on" : "off"}
+          </p>
+        </Card>
+        <Card title="Goals & Plan">
+          {(health?.coaching_panel?.goals ?? []).length ? (
+            <ul className="clean-list">
+              {health!.coaching_panel.goals.map((goal: ApiRow) => (
+                <li key={goal.id || goal.progress_line}>
+                  {goal.progress_line || goal.goal_text}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="muted">No active goals.</p>
+          )}
+          <p className="insight">{health?.coaching_panel?.plan_summary || "No fitness plan."}</p>
+        </Card>
+        <Card title="Next Nudges (HKT)">
+          <ul className="clean-list">
+            <li>Morning: {health?.coaching_panel?.next_nudges?.morning_summary ?? "—"}</li>
+            <li>Evening: {health?.coaching_panel?.next_nudges?.evening_summary ?? "—"}</li>
+            <li>Readiness: {health?.coaching_panel?.next_nudges?.readiness_nudge ?? "off"}</li>
+            <li>Workout: {health?.coaching_panel?.next_nudges?.workout_nudge ?? "—"}</li>
+            <li>Weekly: {health?.coaching_panel?.next_nudges?.weekly_recap ?? "—"}</li>
+          </ul>
+        </Card>
+      </div>
+
+      <div className="grid">
         <Card title="Steps Trend">
           {trends.length ? (
             <ResponsiveContainer width="100%" height={240}>

@@ -9,6 +9,72 @@ from typing import Any
 
 from .timezone import format_utc_iso, now_utc, parse_to_utc, user_utc_offset_duration
 
+VALID_MEAL_TYPES = frozenset(
+    {
+        "MEAL_TYPE_UNSPECIFIED",
+        "BEFORE_BREAKFAST",
+        "BREAKFAST",
+        "BEFORE_LUNCH",
+        "LUNCH",
+        "BEFORE_DINNER",
+        "DINNER",
+        "AFTER_DINNER",
+        "SNACK",
+        "ANYTIME",
+    }
+)
+
+_MEAL_TYPE_ALIASES: dict[str, str] = {
+    "UNKNOWN": "MEAL_TYPE_UNSPECIFIED",
+    "UNSPECIFIED": "MEAL_TYPE_UNSPECIFIED",
+    "MEAL_TYPE_UNSPECIFIED": "MEAL_TYPE_UNSPECIFIED",
+    "DRINK": "SNACK",
+    "DRINKS": "SNACK",
+    "ALCOHOL": "SNACK",
+    "BEVERAGE": "SNACK",
+    "BEVERAGES": "SNACK",
+    "WINE": "SNACK",
+    "BEER": "SNACK",
+    "COCKTAIL": "SNACK",
+    "COCKTAILS": "SNACK",
+}
+
+BATCH_NUTRITION_MAX_ITEMS = 8
+
+
+def normalize_meal_type(raw: str | None) -> str:
+    """Map LLM meal labels to Google Health API v4 MealType enum values."""
+    if not raw or not str(raw).strip():
+        return "MEAL_TYPE_UNSPECIFIED"
+    cleaned = str(raw).strip().upper().replace(" ", "_").replace("-", "_")
+    if cleaned in _MEAL_TYPE_ALIASES:
+        return _MEAL_TYPE_ALIASES[cleaned]
+    lowered = str(raw).strip().lower()
+    if any(word in lowered for word in ("wine", "beer", "cocktail", "drink", "whiskey", "vodka", "gin")):
+        return "SNACK"
+    if cleaned in VALID_MEAL_TYPES:
+        return cleaned
+    return "MEAL_TYPE_UNSPECIFIED"
+
+
+def expand_nutrition_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expand single-item or batch LOG_NUTRITION payloads into per-item dicts."""
+    items = payload.get("items")
+    if isinstance(items, list) and items:
+        expanded: list[dict[str, Any]] = []
+        for item in items[:BATCH_NUTRITION_MAX_ITEMS]:
+            if not isinstance(item, dict):
+                continue
+            merged = dict(payload)
+            merged.pop("items", None)
+            merged.update(item)
+            if merged.get("food_display_name"):
+                expanded.append(merged)
+        return expanded
+    if payload.get("food_display_name"):
+        return [dict(payload)]
+    return []
+
 
 def _utc_now() -> str:
     return format_utc_iso(now_utc())
@@ -107,7 +173,7 @@ def build_nutrition_data_point(payload: dict[str, Any]) -> dict[str, Any]:
         "nutritionLog": {
             "interval": _session_interval(payload, default_duration_minutes=15),
             "foodDisplayName": payload.get("food_display_name") or "Logged meal",
-            "mealType": payload.get("meal_type") or "UNKNOWN",
+            "mealType": normalize_meal_type(payload.get("meal_type")),
             "energy": {"kcal": _safe_int(payload.get("calories_kcal"))},
             "totalCarbohydrate": {"grams": _safe_float(payload.get("carbs_grams"))},
             "totalFat": {"grams": _safe_float(payload.get("fat_grams"))},
@@ -133,6 +199,64 @@ def build_hydration_data_point(payload: dict[str, Any]) -> dict[str, Any]:
                 "milliliters": _safe_float(payload.get("milliliters"), 250),
                 "userProvidedUnit": payload.get("unit") or "MILLILITER",
             },
+        }
+    }
+
+
+def normalize_exercise_type(raw: str | None) -> str:
+    """Normalize exercise type to Google Health Exercise.ExerciseType enum."""
+    if not raw or not str(raw).strip():
+        return "EXERCISE_TYPE_UNSPECIFIED"
+    cleaned = str(raw).strip().upper().replace(" ", "_").replace("-", "_")
+    aliases = {
+        "RUN": "RUNNING",
+        "RUNS": "RUNNING",
+        "JOG": "RUNNING",
+        "JOGGING": "RUNNING",
+        "WALK": "WALKING",
+        "WALKS": "WALKING",
+        "GYM": "STRENGTH_TRAINING",
+        "WEIGHTS": "STRENGTH_TRAINING",
+        "WEIGHT_TRAINING": "STRENGTH_TRAINING",
+        "LIFT": "STRENGTH_TRAINING",
+        "YOGA": "YOGA",
+        "PILATES": "PILATES",
+        "SWIM": "SWIMMING",
+        "CYCLE": "BIKING",
+        "CYCLING": "BIKING",
+        "HIIT": "HIIT",
+        "PICKLEBALL": "PICKLEBALL",
+        "TENNIS": "TENNIS",
+        "CARDIO": "CARDIO_WORKOUT",
+    }
+    if cleaned in aliases:
+        return aliases[cleaned]
+    return cleaned
+
+
+def _duration_seconds(payload: dict[str, Any], *, default_minutes: int = 30) -> str:
+    minutes = payload.get("duration_minutes")
+    if minutes is None:
+        minutes = default_minutes
+    seconds = max(1, int(float(minutes) * 60))
+    return f"{seconds}s"
+
+
+def build_exercise_data_point(payload: dict[str, Any]) -> dict[str, Any]:
+    calories = _safe_int(payload.get("calories_kcal"), 0)
+    metrics: dict[str, Any] = {}
+    if calories > 0:
+        metrics["activeEnergy"] = {"kcal": calories}
+    return {
+        "exercise": {
+            "interval": _session_interval(payload, default_duration_minutes=int(
+                payload.get("duration_minutes") or 30
+            )),
+            "exerciseType": normalize_exercise_type(payload.get("exercise_type")),
+            "displayName": payload.get("display_name") or payload.get("food_display_name") or "Workout",
+            "activeDuration": _duration_seconds(payload),
+            "notes": payload.get("notes") or "",
+            "metricsSummary": metrics or {"activeEnergy": {"kcal": 0}},
         }
     }
 
@@ -180,5 +304,10 @@ def normalize_router_payload(intent: str, payload: dict[str, Any]) -> dict[str, 
         return {
             "data_type": "weight",
             "data_point": build_weight_data_point(payload),
+        }
+    if intent == "LOG_EXERCISE":
+        return {
+            "data_type": "exercise",
+            "data_point": build_exercise_data_point(payload),
         }
     return payload

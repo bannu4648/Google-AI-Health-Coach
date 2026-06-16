@@ -61,9 +61,41 @@ def test_last_night_sleep_bounds_cover_previous_evening(monkeypatch):
     assert "2026-06-11" in end
 
 
+def test_readiness_uses_sleep_hours():
+    snapshot = {
+        "steps": {"count": 5000},
+        "exercise": {"count": 0},
+        "sleep": {"count": 1, "duration_hours": 5.2, "deep_minutes": 25},
+        "active_zone_minutes": {"total": 10},
+        "resting_heart_rate": {"bpm": 72},
+        "nutrition": {"count": 2},
+    }
+    result = coaching.readiness_score(snapshot)
+    assert result["label"] in {"steady", "recover", "ready"}
+    assert any("5.2" in reason for reason in result["reasons"])
+
+
+def test_morning_readiness_uses_last_night_sleep():
+    snapshot = {
+        "last_night_sleep": {"count": 1, "duration_hours": 8.1, "rem_minutes": 95},
+        "weekly_trends": {
+            "steps": {"average_on_active_days": 9000},
+            "exercise": {"total_sessions": 4},
+            "active_zone_minutes": {"daily": [{"value": 15}]},
+        },
+    }
+    result = coaching.morning_readiness_score(snapshot)
+    assert result["score"] >= 55
+    assert any("8.1" in reason or "sleep" in reason.lower() for reason in result["reasons"])
+
+
 def test_create_daily_summary_branches_on_type(monkeypatch):
     client = _mock_health_client()
-    monkeypatch.setattr(coaching, "build_daily_coach_message", lambda st, snap: f"{st}-message")
+    monkeypatch.setattr(
+        coaching,
+        "build_daily_coach_message",
+        lambda st, snap, client=None: f"{st}-message",
+    )
 
     evening = coaching.create_daily_summary("evening", client=client)
     morning = coaching.create_daily_summary("morning", client=client)

@@ -8,6 +8,7 @@ redacted before persistence.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -187,6 +188,109 @@ def init_db() -> None:
                 message TEXT NOT NULL DEFAULT ''
             );
 
+            CREATE TABLE IF NOT EXISTS whatsapp_message_dedup (
+                message_id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS whatsapp_message_replies (
+                message_id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                reply_text TEXT NOT NULL,
+                send_status TEXT NOT NULL,
+                phone TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS fitness_plans (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                week_start_hkt TEXT NOT NULL,
+                goals_json TEXT NOT NULL DEFAULT '{}',
+                weekly_targets_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'active'
+            );
+
+            CREATE TABLE IF NOT EXISTS fitness_workouts (
+                id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                day_of_week INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                exercise_type TEXT,
+                steps_json TEXT NOT NULL DEFAULT '[]',
+                duration_minutes INTEGER,
+                completed_at TEXT,
+                FOREIGN KEY (plan_id) REFERENCES fitness_plans(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS mood_logs (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                logged_at_hkt TEXT NOT NULL,
+                mood_level INTEGER NOT NULL,
+                notes TEXT,
+                tags_json TEXT NOT NULL DEFAULT '[]'
+            );
+
+            CREATE TABLE IF NOT EXISTS cycle_logs (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                logged_at_hkt TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                details_json TEXT NOT NULL DEFAULT '{}'
+            );
+
+            CREATE TABLE IF NOT EXISTS document_summaries (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                phone TEXT,
+                filename TEXT,
+                mime_type TEXT,
+                summary TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_replies_created ON whatsapp_message_replies(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_fitness_plans_week ON fitness_plans(week_start_hkt DESC);
+            CREATE INDEX IF NOT EXISTS idx_mood_logged ON mood_logs(logged_at_hkt DESC);
+            CREATE INDEX IF NOT EXISTS idx_cycle_logged ON cycle_logs(logged_at_hkt DESC);
+
+            CREATE TABLE IF NOT EXISTS user_goals (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                category TEXT NOT NULL,
+                goal_text TEXT NOT NULL,
+                target_json TEXT NOT NULL DEFAULT '{}',
+                progress_json TEXT NOT NULL DEFAULT '{}',
+                deadline_hkt TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                google_health_sync TEXT NOT NULL DEFAULT 'none'
+            );
+
+            CREATE TABLE IF NOT EXISTS coach_db_queries (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                purpose TEXT NOT NULL DEFAULT '',
+                sql_text TEXT NOT NULL,
+                status TEXT NOT NULL,
+                row_count INTEGER,
+                error TEXT,
+                result_json TEXT NOT NULL DEFAULT '[]'
+            );
+
+            CREATE TABLE IF NOT EXISTS oauth_pending_states (
+                state TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                phone TEXT,
+                used_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_goals_status ON user_goals(status, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_coach_db_queries_created ON coach_db_queries(created_at DESC);
+
             CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_llm_created ON llm_calls(created_at DESC);
@@ -194,8 +298,68 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_tavily_created ON tavily_calls(created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_actions_created ON health_actions(created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_jobs_created ON job_runs(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS coaching_preferences (
+                pref_key TEXT PRIMARY KEY,
+                coaching_focus TEXT NOT NULL DEFAULT '',
+                settings_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS pending_graph_interrupts (
+                thread_id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                interrupt_payload_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'pending'
+            );
+
+            CREATE TABLE IF NOT EXISTS undoable_health_logs (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                intent TEXT NOT NULL,
+                data_type TEXT NOT NULL,
+                resource_name TEXT,
+                google_id TEXT,
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_undoable_created ON undoable_health_logs(created_at DESC);
             """
         )
+        _ensure_coach_views(conn)
+
+
+def _ensure_coach_views(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE VIEW IF NOT EXISTS v_active_fitness_plan AS
+        SELECT
+            fp.id AS plan_id,
+            fp.week_start_hkt,
+            fp.goals_json,
+            fp.status AS plan_status,
+            fw.id AS workout_id,
+            fw.day_of_week,
+            fw.title,
+            fw.exercise_type,
+            fw.duration_minutes,
+            fw.steps_json,
+            fw.completed_at
+        FROM fitness_plans fp
+        JOIN fitness_workouts fw ON fw.plan_id = fp.id
+        WHERE fp.status = 'active';
+
+        CREATE VIEW IF NOT EXISTS v_recent_mood AS
+        SELECT id, logged_at_hkt, mood_level, notes, tags_json
+        FROM mood_logs;
+
+        CREATE VIEW IF NOT EXISTS v_active_goals AS
+        SELECT id, category, goal_text, target_json, progress_json, deadline_hkt, status
+        FROM user_goals
+        WHERE status = 'active';
+        """
+    )
 
 
 def _insert(table: str, values: dict[str, Any]) -> str:
@@ -225,17 +389,89 @@ def record_event(event_type: str, source: str, *, status: str = "", summary: str
     )
 
 
-def record_message(direction: str, *, phone: str | None, text: str | None, status: str = "", payload: Any = None) -> str:
-    return _insert(
-        "messages",
-        {
-            "direction": direction,
-            "phone": phone,
-            "text": text,
-            "status": status,
-            "payload_json": to_json(payload or {}),
-        },
-    )
+def record_message(
+    direction: str,
+    *,
+    phone: str | None,
+    text: str | None,
+    status: str = "",
+    payload: Any = None,
+    message_id: str | None = None,
+) -> str:
+    row: dict[str, Any] = {
+        "direction": direction,
+        "phone": phone,
+        "text": text,
+        "status": status,
+        "payload_json": to_json(payload or {}),
+    }
+    if message_id:
+        row["id"] = message_id
+    return _insert("messages", row)
+
+
+def hash_webhook_body(body: Any) -> str:
+    normalized = json.dumps(body, sort_keys=True, default=str)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def claim_whatsapp_message(message_id: str | None, *, body_hash: str | None = None) -> bool:
+    """
+    Atomically claim a WhatsApp inbound message id for processing.
+
+    Meta may retry webhooks when replies are slow; only the first claim should
+    run the coach and send a WhatsApp response.
+    """
+    claim_id = message_id or (f"hash:{body_hash}" if body_hash else None)
+    if not claim_id:
+        return True
+    init_db()
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO whatsapp_message_dedup (message_id, created_at)
+            VALUES (?, ?)
+            """,
+            (claim_id, utc_now_iso()),
+        )
+        return cursor.rowcount == 1
+
+
+def get_whatsapp_reply(message_id: str | None) -> dict[str, Any] | None:
+    if not message_id:
+        return None
+    init_db()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM whatsapp_message_replies WHERE message_id = ?",
+            (message_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def record_whatsapp_reply(
+    message_id: str,
+    *,
+    reply_text: str,
+    send_status: str,
+    phone: str | None = None,
+) -> str:
+    init_db()
+    now = utc_now_iso()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO whatsapp_message_replies (message_id, created_at, reply_text, send_status, phone)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(message_id) DO UPDATE SET
+                created_at = excluded.created_at,
+                reply_text = excluded.reply_text,
+                send_status = excluded.send_status,
+                phone = excluded.phone
+            """,
+            (message_id, now, reply_text, send_status, phone),
+        )
+    return message_id
 
 
 def record_llm_call(
@@ -415,13 +651,83 @@ def fetch_recent_messages_for_phone(phone: str, *, limit: int = 16) -> list[dict
             """
             SELECT direction, text, created_at, status
             FROM messages
-            WHERE phone = ? AND text IS NOT NULL
+            WHERE phone = ?
+              AND text IS NOT NULL
+              AND status IN ('received', 'sent', 'received_image')
             ORDER BY created_at DESC
             LIMIT ?
             """,
             (phone, limit),
         ).fetchall()
     return list(reversed([dict(row) for row in rows]))
+
+
+def create_oauth_pending_state(*, phone: str | None, expires_at: str, state: str) -> str:
+    init_db()
+    now = utc_now_iso()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO oauth_pending_states (state, created_at, expires_at, phone, used_at)
+            VALUES (?, ?, ?, ?, NULL)
+            """,
+            (state, now, expires_at, phone),
+        )
+    return state
+
+
+def get_oauth_pending_state(state: str) -> dict[str, Any] | None:
+    init_db()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM oauth_pending_states WHERE state = ?",
+            (state,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def mark_oauth_pending_state_used(state: str) -> None:
+    init_db()
+    with connect() as conn:
+        conn.execute(
+            "UPDATE oauth_pending_states SET used_at = ? WHERE state = ?",
+            (utc_now_iso(), state),
+        )
+
+
+def record_undoable_log(
+    *,
+    intent: str,
+    data_type: str,
+    resource_name: str | None = None,
+    google_id: str | None = None,
+    payload: Any = None,
+) -> str:
+    return _insert(
+        "undoable_health_logs",
+        {
+            "intent": intent,
+            "data_type": data_type,
+            "resource_name": resource_name,
+            "google_id": google_id,
+            "payload_json": to_json(payload or {}),
+        },
+    )
+
+
+def fetch_latest_undoable_log() -> dict[str, Any] | None:
+    init_db()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM undoable_health_logs ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def delete_undoable_log(log_id: str) -> None:
+    init_db()
+    with connect() as conn:
+        conn.execute("DELETE FROM undoable_health_logs WHERE id = ?", (log_id,))
 
 
 init_db()

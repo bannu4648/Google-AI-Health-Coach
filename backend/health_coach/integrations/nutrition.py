@@ -410,7 +410,11 @@ def should_skip_health_sync(intent: str, resolved: dict[str, Any]) -> bool:
 
 def needs_nutrition_lookup(intent: str, payload: dict[str, Any]) -> bool:
     """Whether the graph should run Tavily before executing a nutrition action."""
+    from ..core.payloads import expand_nutrition_items
+
     if intent in {"LOG_NUTRITION", "QUERY_NUTRITION"}:
+        if payload.get("items"):
+            return bool(expand_nutrition_items(payload))
         return bool(payload.get("food_display_name"))
     if intent == "UPDATE_NUTRITION":
         if not payload.get("food_display_name") and not payload.get("portion_description"):

@@ -15,6 +15,18 @@ from threading import Lock
 from ..core.database import fetch_recent_messages_for_phone
 
 MAX_TURNS = int(os.getenv("CONVERSATION_MAX_TURNS", "8"))
+COACHING_MAX_TURNS = int(os.getenv("CONVERSATION_COACHING_MAX_TURNS", "16"))
+COACHING_INTENTS = frozenset(
+    {
+        "COACHING_CHAT",
+        "BUILD_WELLNESS_PLAN",
+        "LOG_GOAL",
+        "UPDATE_GOAL",
+        "QUERY_GOALS",
+        "CREATE_FITNESS_PLAN",
+        "QUERY_FITNESS_PLAN",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -32,14 +44,41 @@ def get_history(sender_phone: str) -> list[Turn]:
         return list(_histories.get(sender_phone, deque()))
 
 
-def format_history_for_prompt(sender_phone: str) -> str:
-    persisted = fetch_recent_messages_for_phone(sender_phone, limit=MAX_TURNS * 2)
+def _truncate_history_text(text: str, *, max_chars: int = 600) -> str:
+    cleaned = " ".join(text.split())
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[: max_chars - 1] + "…"
+
+
+def format_history_for_prompt(
+    sender_phone: str,
+    *,
+    exclude_user_text: str | None = None,
+    intent: str = "",
+) -> str:
+    max_turns = COACHING_MAX_TURNS if intent in COACHING_INTENTS else MAX_TURNS
+    persisted = fetch_recent_messages_for_phone(sender_phone, limit=max_turns * 2)
     if persisted:
         lines = ["Recent conversation (oldest first):"]
+        excluded = (exclude_user_text or "").strip()
+        skipped_current = False
         for row in persisted:
+            text = (row.get("text") or "").strip()
+            if not text:
+                continue
+            if (
+                not skipped_current
+                and excluded
+                and row["direction"] == "inbound"
+                and text == excluded
+            ):
+                skipped_current = True
+                continue
             label = "User" if row["direction"] == "inbound" else "Coach"
-            lines.append(f"{label}: {row['text']}")
-        return "\n".join(lines)
+            lines.append(f"{label}: {_truncate_history_text(text)}")
+        if len(lines) > 1:
+            return "\n".join(lines)
 
     turns = get_history(sender_phone)
     if not turns:
@@ -47,7 +86,7 @@ def format_history_for_prompt(sender_phone: str) -> str:
     lines = ["Recent conversation (oldest first):"]
     for turn in turns:
         label = "User" if turn.role == "user" else "Coach"
-        lines.append(f"{label}: {turn.text}")
+        lines.append(f"{label}: {_truncate_history_text(turn.text)}")
     return "\n".join(lines)
 
 

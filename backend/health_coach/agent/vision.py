@@ -10,7 +10,9 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from ..core.timezone import llm_time_context
-from ..integrations.gemini_client import GeminiClient
+from ..agent.engine import _system_prompt
+from ..integrations.llm import LLMProvider
+from ..integrations.llm.factory import create_llm_provider
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +43,7 @@ VISION_SYSTEM_PROMPT = """You are a food-vision specialist for a personal health
 Analyze the meal photo and return JSON with exactly these keys:
 - food_display_name (string, concise label e.g. "Chicken rice with vegetables")
 - portion_description (string, best estimate e.g. "1 plate (~350g)")
-- meal_type (BREAKFAST|LUNCH|DINNER|SNACK|UNKNOWN)
+- meal_type (BREAKFAST|LUNCH|DINNER|SNACK|MEAL_TYPE_UNSPECIFIED)
 - wants_to_log (boolean) — true if the user caption clearly asks to log/save/record/add to app
 - lookup_only (boolean) — true if caption says don't log, just curious, or no logging intent
 - confidence (high|medium|low)
@@ -62,7 +64,7 @@ Rules:
 class VisionAnalysis(BaseModel):
     food_display_name: str
     portion_description: str = ""
-    meal_type: str = "UNKNOWN"
+    meal_type: str = "MEAL_TYPE_UNSPECIFIED"
     wants_to_log: bool = False
     lookup_only: bool = True
     confidence: str = "medium"
@@ -71,10 +73,10 @@ class VisionAnalysis(BaseModel):
 
 
 class VisionAgent:
-    """Gemini vision specialist for meal photos."""
+    """Vision specialist for meal photos (requires a vision-capable provider, e.g. Gemini)."""
 
-    def __init__(self, client: GeminiClient | None = None):
-        self._client = client or GeminiClient()
+    def __init__(self, client: LLMProvider | None = None):
+        self._client = client or create_llm_provider()
 
     def analyze_food_image(
         self,
@@ -83,6 +85,7 @@ class VisionAgent:
         mime_type: str,
         caption: str = "",
         conversation_context: str = "",
+        user_profile_context: str = "",
     ) -> dict[str, Any]:
         prompt_parts = [llm_time_context()]
         if conversation_context.strip():
@@ -95,7 +98,7 @@ class VisionAgent:
         try:
             parsed = self._client.generate_structured(
                 purpose="analyze_food_image",
-                system_prompt=VISION_SYSTEM_PROMPT,
+                system_prompt=_system_prompt(VISION_SYSTEM_PROMPT, user_profile_context),
                 user_prompt=user_prompt,
                 response_model=VisionAnalysis,
                 temperature=0.2,
@@ -109,7 +112,7 @@ class VisionAgent:
             return {
                 "food_display_name": "Meal from photo",
                 "portion_description": "1 serving",
-                "meal_type": "UNKNOWN",
+                "meal_type": "MEAL_TYPE_UNSPECIFIED",
                 "wants_to_log": _caption_requests_logging(caption),
                 "lookup_only": not _caption_requests_logging(caption),
                 "confidence": "low",

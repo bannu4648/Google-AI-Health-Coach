@@ -1,10 +1,12 @@
 """
-Gemini-powered multi-agent LLM facade for the health coach bot.
+Provider-agnostic multi-agent LLM facade for the health coach bot.
 
 Specialist agents:
 - Router (this module) — intent routing and summarization
 - Vision (agent/vision.py) — food photo analysis
-- Nutrition / research — resolved via Tavily + Gemini structured output
+- Nutrition / research — resolved via Tavily + structured LLM output
+
+Swap providers via LLM_PROVIDER in .env (gemini, mistral, …).
 """
 
 from __future__ import annotations
@@ -21,14 +23,8 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 from ..core.types import DATA_TYPE_PROMPT_LIST, normalize_query_payload
 from ..core.database import record_llm_call
 from ..core.timezone import llm_time_context
-from ..integrations.gemini_client import (
-    GEMINI_CALL_DELAY_SECONDS,
-    GEMINI_MODEL,
-    GEMINI_RATE_LIMIT_BACKOFF_SECONDS,
-    GEMINI_RATE_LIMIT_MAX_RETRIES,
-    RATE_LIMIT_USER_REPLY,
-    GeminiClient,
-)
+from ..integrations.llm import LLMProvider, create_llm_provider
+from ..integrations.llm.gemini import RATE_LIMIT_USER_REPLY
 from ..integrations.nutrition import search_has_usable_results
 
 load_dotenv()
@@ -43,10 +39,26 @@ class Intent(str, Enum):
     GENERAL_RESEARCH = "GENERAL_RESEARCH"
     LOG_HYDRATION = "LOG_HYDRATION"
     LOG_WEIGHT = "LOG_WEIGHT"
+    LOG_EXERCISE = "LOG_EXERCISE"
+    UPDATE_EXERCISE = "UPDATE_EXERCISE"
+    CREATE_FITNESS_PLAN = "CREATE_FITNESS_PLAN"
+    QUERY_FITNESS_PLAN = "QUERY_FITNESS_PLAN"
+    COMPLETE_WORKOUT = "COMPLETE_WORKOUT"
+    LOG_MOOD = "LOG_MOOD"
+    QUERY_MOOD_HISTORY = "QUERY_MOOD_HISTORY"
+    LOG_CYCLE = "LOG_CYCLE"
+    QUERY_CYCLE = "QUERY_CYCLE"
+    QUERY_COACH_DATA = "QUERY_COACH_DATA"
+    LOG_GOAL = "LOG_GOAL"
+    UPDATE_GOAL = "UPDATE_GOAL"
+    QUERY_GOALS = "QUERY_GOALS"
+    BUILD_WELLNESS_PLAN = "BUILD_WELLNESS_PLAN"
+    SUMMARIZE_DOCUMENT = "SUMMARIZE_DOCUMENT"
     QUERY_HISTORY = "QUERY_HISTORY"
     QUERY_TRENDS = "QUERY_TRENDS"
     QUERY_SLEEP = "QUERY_SLEEP"
     COACHING_CHAT = "COACHING_CHAT"
+    UNDO_LAST_LOG = "UNDO_LAST_LOG"
 
 
 GOOGLE_HEALTH_QUERY_INTENTS = {
@@ -94,6 +106,60 @@ class RouterResponse(BaseModel):
         return normalized
 
 
+class FitnessPlanResponse(BaseModel):
+    week_start_hkt: str = ""
+    goals: dict[str, Any] = Field(default_factory=dict)
+    weekly_targets: dict[str, Any] = Field(default_factory=dict)
+    workouts: list[dict[str, Any]] = Field(default_factory=list)
+    conversational_reply: str = ""
+
+
+class WellnessPlanResponse(BaseModel):
+    final_reply: str
+    meal_prep_highlights: list[str] = Field(default_factory=list)
+    workout_highlights: list[str] = Field(default_factory=list)
+
+
+class DocumentSummaryResponse(BaseModel):
+    final_reply: str
+    key_points: list[str] = Field(default_factory=list)
+
+
+class HealthPayloadFixResponse(BaseModel):
+    payload: dict[str, Any] = Field(default_factory=dict)
+    fix_summary: str = ""
+
+
+HEALTH_PAYLOAD_FIX_SYSTEM_PROMPT = """You fix Google Health API v4 write payloads after validation errors.
+
+Return JSON with:
+- payload: corrected flat payload fields only (same keys the router uses)
+- fix_summary: one short sentence describing what you changed
+
+Rules:
+- meal_type must be one of: MEAL_TYPE_UNSPECIFIED, BREAKFAST, LUNCH, DINNER, SNACK, BEFORE_BREAKFAST, BEFORE_LUNCH, BEFORE_DINNER, AFTER_DINNER, ANYTIME
+- exercise_type must be a valid Exercise.ExerciseType enum value (e.g. RUNNING, STRENGTH_TRAINING, HIIT, WALKING, BIKING, CARDIO_WORKOUT)
+- hydration unit: MILLILITER, CUP_US, or FLUID_OUNCE_US
+- Do not remove required fields like food_display_name, display_name, calories_kcal when present
+- Only change fields implicated by the API error or clearly invalid
+- logged_at_hkt stays as naive HKT YYYY-MM-DDTHH:mm:ss without Z suffix
+"""
+
+
+def _coerce_router_parsed(parsed: Any) -> dict[str, Any]:
+    """Normalize router JSON when the model returns a list for batch nutrition."""
+    if isinstance(parsed, list):
+        items = [item for item in parsed if isinstance(item, dict) and item.get("food_display_name")]
+        return {
+            "intent": Intent.LOG_NUTRITION.value,
+            "payload": {"items": items},
+            "conversational_reply": f"Got it — I'll look up and log {len(items)} item(s) for you.",
+        }
+    if not isinstance(parsed, dict):
+        raise ValueError("Router response must be a JSON object or array of food items.")
+    return parsed
+
+
 class SummaryResponse(BaseModel):
     final_reply: str
 
@@ -130,6 +196,63 @@ class NutritionMacrosResponse(BaseModel):
         return self
 
 
+class CoachDataSummaryResponse(BaseModel):
+    final_reply: str
+
+
+class CoachDbQueryResponse(BaseModel):
+    sql_query: str
+    natural_question: str = ""
+
+
+COACH_DB_SCHEMA = """
+TABLE fitness_plans(id, week_start_hkt, goals_json, weekly_targets_json, status, created_at)
+TABLE fitness_workouts(id, plan_id, day_of_week, title, exercise_type, duration_minutes, steps_json, completed_at)
+  -- day_of_week: 0=Monday .. 6=Sunday
+TABLE mood_logs(id, logged_at_hkt, mood_level, notes, tags_json)
+TABLE cycle_logs(id, logged_at_hkt, event_type, details_json)
+TABLE user_goals(id, category, goal_text, target_json, progress_json, deadline_hkt, status)
+TABLE coach_notes(id, category, note, created_at)
+TABLE daily_summaries(date_hkt, summary_type, message)
+TABLE health_actions(intent, status, created_at)
+VIEW v_active_fitness_plan(plan_id, week_start_hkt, day_of_week, title, duration_minutes, steps_json, completed_at)
+VIEW v_recent_mood(id, logged_at_hkt, mood_level, notes, tags_json)
+VIEW v_active_goals(id, category, goal_text, target_json, progress_json, deadline_hkt, status)
+
+RULES:
+- SELECT only. Always use LIMIT.
+- Prefer v_active_fitness_plan for workout plan questions.
+- For "my plan Tuesday", filter day_of_week (Mon=0, Tue=1, Wed=2, Thu=3).
+- Never query: messages, llm_calls, whatsapp_message_dedup, google_health_calls.
+- week_start_hkt is YYYY-MM-DD (Monday).
+
+Example queries:
+SELECT day_of_week, title, duration_minutes, steps_json FROM v_active_fitness_plan ORDER BY day_of_week LIMIT 20;
+SELECT day_of_week, title, steps_json FROM v_active_fitness_plan WHERE day_of_week IN (1, 3) LIMIT 10;
+SELECT logged_at_hkt, mood_level, notes FROM mood_logs ORDER BY logged_at_hkt DESC LIMIT 14;
+"""
+
+
+COACH_DB_QUERY_SYSTEM_PROMPT = """You write read-only SQLite SELECT queries for the health coach local database.
+
+Return JSON with exactly:
+- sql_query: one SELECT statement against the schema below (must include LIMIT, max 50)
+- natural_question: the user's question restated in plain English
+
+Schema:
+{coach_db_schema}
+
+Rules:
+- SELECT only — never INSERT, UPDATE, DELETE, or DDL
+- Single statement, no semicolons
+- Only query tables/views listed in the schema
+- Prefer v_active_fitness_plan for workout plan questions
+- day_of_week: 0=Monday, 1=Tuesday, 2=Wednesday, 3=Thursday, 4=Friday, 5=Saturday, 6=Sunday
+- For Tuesday + Thursday gym sessions: WHERE day_of_week IN (1, 3)
+- If a previous query failed, fix the SQL using the error hint provided
+""".replace("{coach_db_schema}", COACH_DB_SCHEMA)
+
+
 ROUTER_SYSTEM_PROMPT = """You are an elite personal wellness coach integrated with Google Health API v4.
 
 The user lives in Hong Kong. All natural-language times are in HKT (UTC+8).
@@ -141,9 +264,18 @@ Return JSON with exactly these keys:
 - payload
 - conversational_reply
 
-Valid intents: LOG_NUTRITION, UPDATE_NUTRITION, QUERY_NUTRITION, GENERAL_RESEARCH, LOG_HYDRATION, LOG_WEIGHT, QUERY_HISTORY, QUERY_TRENDS, QUERY_SLEEP, COACHING_CHAT
+Valid intents: LOG_NUTRITION, UPDATE_NUTRITION, QUERY_NUTRITION, GENERAL_RESEARCH, LOG_HYDRATION, LOG_WEIGHT,
+LOG_EXERCISE, UPDATE_EXERCISE, CREATE_FITNESS_PLAN, QUERY_FITNESS_PLAN, COMPLETE_WORKOUT,
+LOG_MOOD, QUERY_MOOD_HISTORY, LOG_CYCLE, QUERY_CYCLE, QUERY_COACH_DATA,
+LOG_GOAL, UPDATE_GOAL, QUERY_GOALS, BUILD_WELLNESS_PLAN, SUMMARIZE_DOCUMENT,
+QUERY_HISTORY, QUERY_TRENDS, QUERY_SLEEP, COACHING_CHAT, UNDO_LAST_LOG
 
 Use recent conversation context when the user is correcting or following up on a prior log.
+
+COACH MEMORY in the user message block summarizes local SQLite state (plans, goals, mood).
+For "give me my plan" or today's workout -> QUERY_FITNESS_PLAN (deterministic, no SQL).
+For ad-hoc coach history questions (mood counts, goal progress, complex plan filters) -> QUERY_COACH_DATA with sql_query.
+Never invent workout steps or plan details in conversational_reply for QUERY_FITNESS_PLAN — say a short ack like "Pulling up your plan…"
 
 conversational_reply MUST be a plain WhatsApp-ready string. Never return an object
 such as {"message": "..."} or {"response": "..."} inside conversational_reply.
@@ -153,16 +285,40 @@ The system runs a Tavily web search against trusted nutrition databases
 (USDA FoodData Central, Nutritionix, MyFitnessPal, CalorieKing, Healthline, etc.)
 for LOG_NUTRITION, UPDATE_NUTRITION, and QUERY_NUTRITION. You must NOT guess or invent calories or macros.
 
+Agent tool — query_coach_db:
+For QUERY_COACH_DATA, the system runs a read-only SQLite text2sql lookup against local coach memory
+(plans, goals, mood, cycle logs). You route the question; the query_coach_db tool generates and runs
+the SELECT. Put natural_question in the payload (required). sql_query is optional — omit it and let
+the tool generate SQL. Never invent plan steps or mood entries in conversational_reply; the tool
+returns grounded rows that are summarized into the final reply.
+
 Routing:
 - Nutrition lookup ONLY (no app logging) -> QUERY_NUTRITION
 - Explicit meal logging to Google Health -> LOG_NUTRITION
 - Fixing/correcting a recently logged meal time or details -> UPDATE_NUTRITION
 - General sourced/current health question -> GENERAL_RESEARCH
-- Water/drinks -> LOG_HYDRATION
+- Plain water (non-alcoholic) -> LOG_HYDRATION
+- Alcoholic drinks / cocktails / wine / beer with calories -> LOG_NUTRITION (meal_type SNACK), NOT LOG_HYDRATION
+- Workouts / gym / runs / sports logged to Google Health -> LOG_EXERCISE
+- Fix a recently logged workout -> UPDATE_EXERCISE
+- Create or refresh a weekly fitness plan -> CREATE_FITNESS_PLAN
+- Ask what workout is planned today / this week / specific days -> QUERY_FITNESS_PLAN
+- Mark today's planned workout complete -> COMPLETE_WORKOUT
+- Mood / how they feel -> LOG_MOOD
+- Past mood patterns -> QUERY_MOOD_HISTORY
+- Period / cycle / symptoms -> LOG_CYCLE
+- Cycle history / patterns -> QUERY_CYCLE
+- Set a long-term goal -> LOG_GOAL
+- Update or complete a goal -> UPDATE_GOAL
+- List goals -> QUERY_GOALS
+- Build a tailored meal + workout plan from recent logs and goals -> BUILD_WELLNESS_PLAN
+- Ad-hoc questions about local coach data (plans, goals, mood history) not in Google Health -> QUERY_COACH_DATA
+- Medical PDF or document summary -> SUMMARIZE_DOCUMENT
 - Weight/scale -> LOG_WEIGHT
 - Past logs/history -> QUERY_HISTORY
 - Weekly trends/averages -> QUERY_TRENDS
 - Sleep -> QUERY_SLEEP
+- Undo last log -> UNDO_LAST_LOG (payload: optional data_type hint)
 - General chat -> COACHING_CHAT with empty payload object
 
 GLOBAL no-log rule:
@@ -204,9 +360,15 @@ LOG_NUTRITION payload (flat keys only):
 food_display_name (required),
 portion_description (required when the user mentions quantity, size, or count —
 e.g. "2 chapatis", "1 bowl", "200g chicken breast", "medium latte"),
-meal_type (BREAKFAST|LUNCH|DINNER|SNACK|UNKNOWN),
+meal_type (BREAKFAST|LUNCH|DINNER|SNACK|MEAL_TYPE_UNSPECIFIED),
 logged_at_hkt (required when user mentions a time — local Hong Kong clock time as
 YYYY-MM-DDTHH:mm:ss with NO timezone suffix, e.g. dinner yesterday 10:30pm -> 2026-06-08T22:30:00)
+
+BATCH LOG_NUTRITION — when user lists 2+ foods/drinks in one message, use:
+items: array of {food_display_name, portion_description, meal_type?, logged_at_hkt?}
+Do NOT use flat single-item keys when multiple distinct foods are listed.
+Never promise to log items that are not in items.
+Cap at 8 items. Stagger logged_at_hkt across the evening when user gives a time range.
 
 Do NOT include calories_kcal, protein_grams, carbs_grams, or fat_grams for LOG_NUTRITION.
 The search_nutrition tool resolves macros from trusted web sources after routing.
@@ -228,6 +390,78 @@ milliliters (convert oz/cups to mL), unit (MILLILITER|CUP_US|FLUID_OUNCE_US), lo
 
 LOG_WEIGHT payload:
 weight_grams (convert lb/kg to grams), notes (optional), logged_at_hkt (optional)
+
+LOG_EXERCISE payload:
+display_name (required), exercise_type (e.g. RUNNING, STRENGTH_TRAINING, HIIT, YOGA, WALKING, BIKING),
+duration_minutes (required when mentioned), logged_at_hkt (optional), notes (optional), calories_kcal (optional estimate)
+
+UPDATE_EXERCISE payload:
+display_name (from conversation), duration_minutes (optional), logged_at_hkt (optional for time fixes), notes (optional)
+
+CREATE_FITNESS_PLAN payload:
+goals (object with goal strings), schedule_notes (string), equipment (string), week_start_hkt (optional YYYY-MM-DD Monday)
+
+QUERY_FITNESS_PLAN payload:
+scope (optional: "today" | "full_week" — default full_week when user says "give me the plan"),
+day_filter (optional — day name or list, e.g. "Tuesday", "Tuesday,Thursday", or day_of_week int 0-6)
+
+When user says "give me the plan" / "the plan" / "full plan" -> scope: full_week (never today-only).
+When user says "what's my workout today" -> scope: today.
+
+LOG_GOAL rules:
+- Only use LOG_GOAL when the user states a concrete goal to save.
+- If they ask "can you help log my goals?" with no goal yet -> COACHING_CHAT (ask what goal), NOT LOG_GOAL.
+- Never save the user's question text as the goal itself.
+
+Weight / nutrition plan requests:
+- "meal prep plan", "tailored nutrition plan", "build my meal and workout plan", "analyze my meals and suggest",
+  "weight loss plan", "help me lose weight with a plan" -> BUILD_WELLNESS_PLAN
+- Simple nutrition history without asking for a plan -> QUERY_HISTORY nutrition-log
+- BUILD_WELLNESS_PLAN uses both meal and exercise history plus active goals (and fitness plan if present).
+- If user says "the plan" right after weight/meal discussion -> BUILD_WELLNESS_PLAN, NOT QUERY_FITNESS_PLAN.
+- QUERY_FITNESS_PLAN only when they clearly mean gym/workout/fitness schedule.
+
+BUILD_WELLNESS_PLAN payload:
+focus (optional: weight_loss|meal_prep|general), lookback_days (optional integer, default 21)
+
+QUERY_COACH_DATA payload:
+natural_question (required — user's question about local coach memory),
+sql_query (optional SELECT — omit and query_coach_db tool will generate it)
+
+Examples that should use QUERY_COACH_DATA (not QUERY_FITNESS_PLAN):
+- "how many moods did I log in May?"
+- "what goals are active right now?"
+- "show mood trend last 2 weeks"
+
+Coach DB schema (reference for optional sql_query only — tool generates SQL if omitted):
+{coach_db_schema}
+
+LOG_GOAL payload:
+category (fitness|nutrition|sleep|weight|habit), goal_text (required), target (optional object), deadline_hkt (optional)
+
+UPDATE_GOAL payload:
+goal_id (optional), goal_text (optional), target (optional), progress (optional), status (active|completed|paused)
+
+QUERY_GOALS payload:
+status (optional — active|completed|paused), limit (optional integer, default 10)
+
+COMPLETE_WORKOUT payload:
+workout_id (optional — omit to complete today's planned workout), log_to_google_health (boolean, default true)
+
+LOG_MOOD payload:
+mood_level (1-5 integer), logged_at_hkt (optional), notes (optional), tags (optional string list)
+
+QUERY_MOOD_HISTORY payload:
+limit (optional integer, default 14)
+
+LOG_CYCLE payload:
+event_type (period_start|period_end|flow|symptom), logged_at_hkt (optional), details (optional object with flow/symptom notes)
+
+QUERY_CYCLE payload:
+limit (optional integer, default 30)
+
+SUMMARIZE_DOCUMENT payload:
+filename (optional), user_question (optional — what they want explained from the doc)
 
 QUERY_HISTORY / QUERY_SLEEP / QUERY_TRENDS payload:
 data_type, start_time, end_time (ISO8601 UTC — convert HKT range boundaries to UTC),
@@ -256,9 +490,10 @@ Query routing hints:
 
 For LOG_NUTRITION, say you'll look up trusted sources and log it to their app.
 For QUERY_NUTRITION, say you'll look up trusted sources and share the numbers (not log unless they ask).
+For QUERY_FITNESS_PLAN and QUERY_COACH_DATA, conversational_reply must be a short acknowledgment only — never list workout steps or invent plan details.
 Do not quote calorie numbers in conversational_reply for nutrition intents — macros and source links are filled in later.
 conversational_reply should be warm, concise, and use HKT when mentioning times.
-""".replace("{data_types}", DATA_TYPE_PROMPT_LIST)
+""".replace("{data_types}", DATA_TYPE_PROMPT_LIST).replace("{coach_db_schema}", COACH_DB_SCHEMA)
 
 NUTRITION_RESOLVE_SYSTEM_PROMPT = """You resolve nutrition macros using Tavily web search results.
 
@@ -332,6 +567,36 @@ for user-facing times. Never present raw UTC timestamps as if they were local ti
 Return JSON with key final_reply.
 """
 
+COACH_DATA_SUMMARIZE_SYSTEM_PROMPT = """You answer questions about the user's local coach memory (fitness plans, goals, mood logs).
+
+Given the user's question, a draft reply, and SQLite query rows, write a concise WhatsApp message that:
+- Grounds every fact in the query rows — never invent workouts, goals, or mood entries
+- Uses plain language, no markdown
+- Says clearly if the query returned no rows
+- For workout steps_json, format as readable numbered steps when present
+
+Return JSON with key final_reply.
+"""
+
+WELLNESS_PLAN_SYSTEM_PROMPT = """You create personalized wellness plans for WhatsApp (Hong Kong user).
+
+Given the user's goal, recent meal logs, workout history, active goals, and any existing fitness plan,
+write a structured plan under 3500 characters with these sections (plain text):
+
+1) Goal recap (1-2 sentences)
+2) What I noticed from your logs (patterns in meals, alcohol, workout frequency — be specific)
+3) Mon-Sun meal prep & swaps (breakfast/lunch/dinner ideas, batch prep tips, alcohol reduction swaps)
+4) Workouts this week (use existing fitness plan if provided; otherwise suggest 3-4 sessions)
+5) Top 3 actions for this week
+
+Rules:
+- Ground every observation in the provided data — do not invent meals or workouts they didn't log
+- If meal data is sparse, say so and give conservative general guidance
+- Be practical for Hong Kong lifestyle (eating out, busy weekdays)
+- Return JSON with final_reply (full WhatsApp message), meal_prep_highlights (3 bullets), workout_highlights (3 bullets)
+"""
+
+
 RESEARCH_SYSTEM_PROMPT = """You answer general wellness questions using Tavily web search results.
 
 Return JSON with exactly:
@@ -343,78 +608,100 @@ Rules:
 - Use the search result snippets and URLs as sources.
 - Include at least one full https:// source link in final_reply when sources are available.
 - If results are weak, say so and answer conservatively from general knowledge.
-- For exercise calorie burn, explain that exact burn varies by body weight, intensity, and duration.
+- For exercise calorie burn, personalize using the USER PROFILE when available (weight, age, height).
+- Use recent conversation context for follow-ups (e.g. "what about 20 reps?" refers to the prior exercise).
+- For exercise calorie burn, explain that exact burn still varies by intensity, form, and duration.
 """
 
 
+def _system_prompt(base: str, user_profile_context: str = "", coach_state_context: str = "") -> str:
+    parts = [base]
+    if coach_state_context.strip():
+        parts.append(coach_state_context.strip())
+    if user_profile_context.strip():
+        parts.append(user_profile_context.strip())
+    return "\n\n".join(parts)
+
+
+def _user_prompt(*parts: str) -> str:
+    return "\n\n".join(part.strip() for part in parts if part and part.strip())
+
+
 class AIEngine:
-    """Routes natural-language messages to structured intents via Gemini JSON mode."""
+    """Routes natural-language messages to structured intents via the configured LLM."""
 
     def __init__(
         self,
+        llm: LLMProvider | None = None,
+        *,
         api_key: str | None = None,
-        model_name: str = GEMINI_MODEL,
+        model_name: str | None = None,
+        provider: str | None = None,
         call_delay_seconds: float | None = None,
         rate_limit_max_retries: int | None = None,
         rate_limit_backoff_seconds: float | None = None,
     ):
-        self._client = GeminiClient(
+        self._llm = llm or create_llm_provider(
+            provider,
             api_key=api_key,
             model_name=model_name,
-            call_delay_seconds=call_delay_seconds
-            if call_delay_seconds is not None
-            else GEMINI_CALL_DELAY_SECONDS,
-            rate_limit_max_retries=rate_limit_max_retries
-            if rate_limit_max_retries is not None
-            else GEMINI_RATE_LIMIT_MAX_RETRIES,
-            rate_limit_backoff_seconds=rate_limit_backoff_seconds
-            if rate_limit_backoff_seconds is not None
-            else GEMINI_RATE_LIMIT_BACKOFF_SECONDS,
+            call_delay_seconds=call_delay_seconds,
+            rate_limit_max_retries=rate_limit_max_retries,
+            rate_limit_backoff_seconds=rate_limit_backoff_seconds,
         )
-        self._model = self._client.model_name
+        self._model = self._llm.model_name
 
     @property
-    def call_delay_seconds(self) -> float:
-        return self._client._call_delay_seconds
+    def llm(self) -> LLMProvider:
+        return self._llm
 
-    @staticmethod
-    def _is_rate_limit_error(exc: BaseException) -> bool:
-        return GeminiClient._is_rate_limit_error(exc)
+    # Backward-compatible alias used by graph.py (vision shares the same provider).
+    @property
+    def _client(self) -> LLMProvider:
+        return self._llm
 
-    def _wait_for_call_slot(self) -> None:
-        self._client._wait_for_call_slot()
+    def _is_rate_limit_error(self, exc: BaseException) -> bool:
+        checker = getattr(self._llm, "is_rate_limit_error", None)
+        if callable(checker):
+            return checker(exc)
+        return "429" in str(exc).lower() or "rate limit" in str(exc).lower()
 
-    def _throttle_after_llm_call(self) -> None:
-        self._client._throttle_after_call()
-
-    def _rate_limited_call(self, purpose: str, call):
-        return self._client._rate_limited_call(purpose, call)
+    def _rate_limit_reply(self) -> str:
+        return self._llm.rate_limit_user_reply
 
     def route_message(
         self,
         user_text: str,
         *,
         conversation_context: str = "",
+        user_profile_context: str = "",
+        coach_state_context: str = "",
     ) -> RouterResponse:
         """
         Parse a WhatsApp message into intent, API payload, and coach reply.
 
         Falls back to COACHING_CHAT if JSON validation fails.
         """
-        prompt_parts = [llm_time_context()]
-        if conversation_context.strip():
-            prompt_parts.append(conversation_context.strip())
-        prompt_parts.append(f"User message: {user_text.strip()}")
-        prompt = "\n\n".join(prompt_parts)
+        prompt = _user_prompt(
+            llm_time_context(),
+            conversation_context,
+            coach_state_context,
+            f"User message: {user_text.strip()}",
+        )
 
         started = time.perf_counter()
         try:
-            parsed = self._client.generate_json(
+            parsed = self._llm.generate_json(
                 purpose="route_message",
-                system_prompt=ROUTER_SYSTEM_PROMPT,
+                system_prompt=_system_prompt(
+                    ROUTER_SYSTEM_PROMPT,
+                    user_profile_context,
+                    coach_state_context,
+                ),
                 user_prompt=prompt,
                 temperature=0.2,
             )
+            parsed = _coerce_router_parsed(parsed)
             routed = RouterResponse.model_validate(parsed)
             if routed.payload and routed.intent in GOOGLE_HEALTH_QUERY_INTENTS:
                 routed.payload = normalize_query_payload(
@@ -460,7 +747,7 @@ class AIEngine:
             )
             logger.exception("Gemini routing error: %s", exc)
             reply = (
-                RATE_LIMIT_USER_REPLY
+                self._rate_limit_reply()
                 if self._is_rate_limit_error(exc)
                 else (
                     "My coaching brain is taking a quick breather. "
@@ -480,33 +767,36 @@ class AIEngine:
         payload: dict[str, Any],
         search_result: dict[str, Any],
         intent: str = "LOG_NUTRITION",
+        conversation_context: str = "",
+        user_profile_context: str = "",
     ) -> dict[str, Any]:
         """Fill calories and macros from Tavily search results before Google Health logging."""
         from ..integrations.nutrition import format_tavily_source_links
 
         usable = search_has_usable_results(search_result)
         mode = "lookup_only" if intent == Intent.QUERY_NUTRITION.value else "logging"
-        prompt = (
-            f"{llm_time_context()}\n"
-            f"Mode: {mode}\n"
-            f"User message: {user_text}\n"
-            f"Extracted food fields: {json.dumps(payload, default=str)}\n"
-            f"Tavily search status: {search_result.get('status')}\n"
-            f"Tavily has usable results: {usable}\n"
-            f"Tavily query: {search_result.get('query', '')}\n"
-            f"Tavily answer: {search_result.get('answer') or 'None'}\n"
-            f"Tavily source links:\n{format_tavily_source_links(search_result)}\n"
-            f"Tavily results: {json.dumps(search_result.get('results', []), default=str)[:5000]}\n"
-            f"Search error (if any): {search_result.get('error') or 'None'}\n"
+        prompt = _user_prompt(
+            llm_time_context(),
+            conversation_context,
+            f"Mode: {mode}",
+            f"User message: {user_text}",
+            f"Extracted food fields: {json.dumps(payload, default=str)}",
+            f"Tavily search status: {search_result.get('status')}",
+            f"Tavily has usable results: {usable}",
+            f"Tavily query: {search_result.get('query', '')}",
+            f"Tavily answer: {search_result.get('answer') or 'None'}",
+            f"Tavily source links:\n{format_tavily_source_links(search_result)}",
+            f"Tavily results: {json.dumps(search_result.get('results', []), default=str)[:5000]}",
+            f"Search error (if any): {search_result.get('error') or 'None'}",
             "If Tavily has usable results=false, do NOT use resolution use_search. "
             "Choose educated_guess or ask_followup and explain honestly in nutrition_reply. "
-            "When use_search, nutrition_reply MUST include the full https URL from Tavily source links."
+            "When use_search, nutrition_reply MUST include the full https URL from Tavily source links.",
         )
         started = time.perf_counter()
         try:
-            parsed = self._client.generate_structured(
+            parsed = self._llm.generate_structured(
                 purpose="resolve_nutrition_macros",
-                system_prompt=NUTRITION_RESOLVE_SYSTEM_PROMPT,
+                system_prompt=_system_prompt(NUTRITION_RESOLVE_SYSTEM_PROMPT, user_profile_context),
                 user_prompt=prompt,
                 response_model=NutritionMacrosResponse,
                 temperature=0.1,
@@ -572,25 +862,28 @@ class AIEngine:
         user_text: str,
         draft_reply: str,
         search_result: dict[str, Any],
+        conversation_context: str = "",
+        user_profile_context: str = "",
     ) -> str:
         """Answer a sourced general wellness question from Tavily results."""
         from ..integrations.research import format_research_source_links
 
-        prompt = (
-            f"{llm_time_context()}\n"
-            f"User question: {user_text}\n"
-            f"Draft reply: {draft_reply}\n"
-            f"Tavily query: {search_result.get('query', '')}\n"
-            f"Tavily answer: {search_result.get('answer') or 'None'}\n"
-            f"Tavily source links:\n{format_research_source_links(search_result)}\n"
-            f"Tavily results: {json.dumps(search_result.get('results', []), default=str)[:6000]}\n"
-            f"Search error (if any): {search_result.get('error') or 'None'}"
+        prompt = _user_prompt(
+            llm_time_context(),
+            conversation_context,
+            f"User question: {user_text}",
+            f"Draft reply: {draft_reply}",
+            f"Tavily query: {search_result.get('query', '')}",
+            f"Tavily answer: {search_result.get('answer') or 'None'}",
+            f"Tavily source links:\n{format_research_source_links(search_result)}",
+            f"Tavily results: {json.dumps(search_result.get('results', []), default=str)[:6000]}",
+            f"Search error (if any): {search_result.get('error') or 'None'}",
         )
         started = time.perf_counter()
         try:
-            parsed = self._client.generate_structured(
+            parsed = self._llm.generate_structured(
                 purpose="answer_research_question",
-                system_prompt=RESEARCH_SYSTEM_PROMPT,
+                system_prompt=_system_prompt(RESEARCH_SYSTEM_PROMPT, user_profile_context),
                 user_prompt=prompt,
                 response_model=ResearchResponse,
                 temperature=0.2,
@@ -631,6 +924,8 @@ class AIEngine:
         user_text: str,
         draft_reply: str,
         api_result: dict[str, Any],
+        conversation_context: str = "",
+        user_profile_context: str = "",
     ) -> str:
         """Turn raw API JSON into a coach-style WhatsApp reply."""
         serialized = json.dumps(api_result, default=str)
@@ -641,17 +936,18 @@ class AIEngine:
                 "preview": serialized[:12000],
             }
             serialized = json.dumps(api_result, default=str)
-        prompt = (
-            f"{llm_time_context()}\n"
-            f"User question: {user_text}\n"
-            f"Draft reply: {draft_reply}\n"
-            f"API data: {serialized}"
+        prompt = _user_prompt(
+            llm_time_context(),
+            conversation_context,
+            f"User question: {user_text}",
+            f"Draft reply: {draft_reply}",
+            f"API data: {serialized}",
         )
         started = time.perf_counter()
         try:
-            parsed = self._client.generate_structured(
+            parsed = self._llm.generate_structured(
                 purpose="summarize_health_data",
-                system_prompt=SUMMARIZE_SYSTEM_PROMPT,
+                system_prompt=_system_prompt(SUMMARIZE_SYSTEM_PROMPT, user_profile_context),
                 user_prompt=prompt,
                 response_model=SummaryResponse,
                 temperature=0.3,
@@ -685,3 +981,363 @@ class AIEngine:
             )
             logger.exception("Gemini summarize error: %s", exc)
             return draft_reply
+
+    def summarize_coach_data(
+        self,
+        *,
+        user_text: str,
+        draft_reply: str,
+        query_result: dict[str, Any],
+        natural_question: str = "",
+        conversation_context: str = "",
+        user_profile_context: str = "",
+        coach_state_context: str = "",
+    ) -> str:
+        """Turn coach SQLite rows into a grounded WhatsApp reply."""
+        if query_result.get("error"):
+            return query_result.get("message", draft_reply)
+        rows = query_result.get("rows") or []
+        if not rows:
+            return "I couldn't find matching data in your coach history for that question."
+        serialized = json.dumps(
+            {"rows": rows, "row_count": query_result.get("row_count", len(rows))},
+            default=str,
+        )
+        prompt = _user_prompt(
+            llm_time_context(),
+            conversation_context,
+            f"User question: {natural_question or user_text}",
+            f"Draft reply: {draft_reply}",
+            f"SQLite rows: {serialized}",
+        )
+        started = time.perf_counter()
+        try:
+            parsed = self._llm.generate_structured(
+                purpose="summarize_coach_data",
+                system_prompt=_system_prompt(
+                    COACH_DATA_SUMMARIZE_SYSTEM_PROMPT,
+                    user_profile_context,
+                    coach_state_context,
+                ),
+                user_prompt=prompt,
+                response_model=CoachDataSummaryResponse,
+                temperature=0.2,
+            )
+            if parsed is None:
+                record_llm_call(
+                    purpose="summarize_coach_data",
+                    model=self._model,
+                    status="empty",
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    prompt={"user_text": user_text, "query_result": query_result},
+                )
+                return draft_reply
+            record_llm_call(
+                purpose="summarize_coach_data",
+                model=self._model,
+                status="success",
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                prompt={"user_text": user_text, "query_result": query_result},
+                response=parsed.model_dump(),
+            )
+            return parsed.final_reply
+        except Exception as exc:
+            record_llm_call(
+                purpose="summarize_coach_data",
+                model=self._model,
+                status="error",
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                prompt={"user_text": user_text, "query_result": query_result},
+                error=str(exc),
+            )
+            logger.exception("Coach data summarize error: %s", exc)
+            return draft_reply
+
+    def generate_coach_db_query(
+        self,
+        *,
+        user_text: str,
+        natural_question: str = "",
+        conversation_context: str = "",
+        coach_state_context: str = "",
+        error_hint: str = "",
+        previous_sql: str = "",
+    ) -> CoachDbQueryResponse:
+        """Generate a guarded read-only SELECT for query_coach_db."""
+        question = natural_question or user_text
+        prompt = _user_prompt(
+            llm_time_context(),
+            conversation_context,
+            coach_state_context,
+            f"User question: {question}",
+            f"Previous SQL (if any): {previous_sql or 'none'}",
+            f"Previous error (if any): {error_hint or 'none'}",
+        )
+        started = time.perf_counter()
+        try:
+            parsed = self._llm.generate_structured(
+                purpose="generate_coach_db_query",
+                system_prompt=COACH_DB_QUERY_SYSTEM_PROMPT,
+                user_prompt=prompt,
+                response_model=CoachDbQueryResponse,
+                temperature=0.1,
+            )
+            if parsed is None or not parsed.sql_query.strip():
+                record_llm_call(
+                    purpose="generate_coach_db_query",
+                    model=self._model,
+                    status="empty",
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    prompt={"user_text": user_text, "natural_question": question},
+                )
+                return CoachDbQueryResponse(
+                    sql_query=(
+                        "SELECT day_of_week, title, duration_minutes, steps_json "
+                        "FROM v_active_fitness_plan ORDER BY day_of_week LIMIT 20"
+                    ),
+                    natural_question=question,
+                )
+            if not parsed.natural_question:
+                parsed.natural_question = question
+            record_llm_call(
+                purpose="generate_coach_db_query",
+                model=self._model,
+                status="success",
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                prompt={"user_text": user_text, "natural_question": question},
+                response=parsed.model_dump(),
+            )
+            return parsed
+        except Exception as exc:
+            record_llm_call(
+                purpose="generate_coach_db_query",
+                model=self._model,
+                status="error",
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                prompt={"user_text": user_text, "natural_question": question},
+                error=str(exc),
+            )
+            logger.exception("Coach DB query generation error: %s", exc)
+            return CoachDbQueryResponse(
+                sql_query=(
+                    "SELECT logged_at_hkt, mood_level, notes "
+                    "FROM mood_logs ORDER BY logged_at_hkt DESC LIMIT 14"
+                ),
+                natural_question=question,
+            )
+
+    def transcribe_audio(
+        self,
+        *,
+        audio_bytes: bytes,
+        mime_type: str = "audio/ogg",
+    ) -> str:
+        """Transcribe a WhatsApp voice note via the vision-capable LLM provider."""
+        transcribe = getattr(self._llm, "transcribe_audio", None)
+        if not callable(transcribe):
+            return ""
+        try:
+            return transcribe(audio_bytes=audio_bytes, mime_type=mime_type) or ""
+        except Exception as exc:
+            logger.exception("Audio transcription error: %s", exc)
+            return ""
+
+    def summarize_document(
+        self,
+        *,
+        document_bytes: bytes,
+        mime_type: str,
+        filename: str = "",
+        user_question: str = "",
+        conversation_context: str = "",
+        user_profile_context: str = "",
+    ) -> str:
+        """Summarize a medical or health document."""
+        prompt = _user_prompt(
+            llm_time_context(),
+            conversation_context,
+            f"Filename: {filename or 'document'}",
+            f"User question: {user_question or 'Summarize this document in plain language.'}",
+        )
+        summarize = getattr(self._llm, "summarize_document", None)
+        if callable(summarize):
+            try:
+                return summarize(
+                    document_bytes=document_bytes,
+                    mime_type=mime_type,
+                    system_prompt=_system_prompt(
+                        "You summarize health and medical documents for a WhatsApp coach in Hong Kong. "
+                        "Return plain text under 900 chars. Include a brief disclaimer to consult their doctor "
+                        "for medical decisions. Never diagnose.",
+                        user_profile_context,
+                    ),
+                    user_prompt=prompt,
+                )
+            except Exception as exc:
+                logger.exception("Document summarize error: %s", exc)
+        return (
+            "I received your document but couldn't summarize it right now. "
+            "Please try again or describe what you'd like to know."
+        )
+
+    def generate_fitness_plan(
+        self,
+        *,
+        user_text: str,
+        payload: dict[str, Any],
+        conversation_context: str = "",
+        user_profile_context: str = "",
+    ) -> FitnessPlanResponse | None:
+        """Create a structured weekly fitness plan."""
+        prompt = _user_prompt(
+            llm_time_context(),
+            conversation_context,
+            f"User request: {user_text}",
+            f"Payload: {json.dumps(payload, default=str)}",
+            "Return workouts for Mon-Sun (day_of_week 0=Monday .. 6=Sunday) with numbered step strings.",
+        )
+        system = (
+            "You create personalized weekly fitness plans for WhatsApp. "
+            "Return JSON: week_start_hkt (YYYY-MM-DD Monday), goals (object), weekly_targets (object), "
+            "workouts (list of {day_of_week, title, exercise_type, duration_minutes, steps: [string]}), "
+            "conversational_reply (warm summary)."
+        )
+        try:
+            parsed = self._llm.generate_structured(
+                purpose="generate_fitness_plan",
+                system_prompt=_system_prompt(system, user_profile_context),
+                user_prompt=prompt,
+                response_model=FitnessPlanResponse,
+                temperature=0.3,
+            )
+            return parsed
+        except Exception as exc:
+            logger.exception("Fitness plan generation error: %s", exc)
+            return None
+
+    def generate_wellness_plan(
+        self,
+        *,
+        user_text: str,
+        payload: dict[str, Any],
+        wellness_context: dict[str, Any],
+        conversation_context: str = "",
+        user_profile_context: str = "",
+        coach_state_context: str = "",
+    ) -> WellnessPlanResponse | None:
+        """Create a structured meal + workout wellness plan from recent health data."""
+        serialized = json.dumps(wellness_context, default=str)
+        if len(serialized) > 14000:
+            wellness_context = {
+                "truncated": True,
+                "nutrition_count": wellness_context.get("nutrition", {}).get("count", 0),
+                "exercise_count": wellness_context.get("exercise", {}).get("count", 0),
+                "goals": wellness_context.get("goals", []),
+                "fitness_plan": wellness_context.get("fitness_plan"),
+                "preview": serialized[:14000],
+            }
+            serialized = json.dumps(wellness_context, default=str)
+        prompt = _user_prompt(
+            llm_time_context(),
+            conversation_context,
+            coach_state_context,
+            f"User request: {user_text}",
+            f"Payload focus: {payload.get('focus', 'general')}",
+            f"Wellness context: {serialized}",
+        )
+        started = time.perf_counter()
+        try:
+            parsed = self._llm.generate_structured(
+                purpose="generate_wellness_plan",
+                system_prompt=_system_prompt(WELLNESS_PLAN_SYSTEM_PROMPT, user_profile_context),
+                user_prompt=prompt,
+                response_model=WellnessPlanResponse,
+                temperature=0.35,
+            )
+            if parsed is None:
+                record_llm_call(
+                    purpose="generate_wellness_plan",
+                    model=self._model,
+                    status="empty",
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    prompt={"user_text": user_text, "payload": payload},
+                )
+                return None
+            record_llm_call(
+                purpose="generate_wellness_plan",
+                model=self._model,
+                status="success",
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                prompt={"user_text": user_text, "payload": payload},
+                response=parsed.model_dump(),
+            )
+            return parsed
+        except Exception as exc:
+            record_llm_call(
+                purpose="generate_wellness_plan",
+                model=self._model,
+                status="error",
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                prompt={"user_text": user_text, "payload": payload},
+                error=str(exc),
+            )
+            logger.exception("Wellness plan generation error: %s", exc)
+            return None
+
+    def fix_health_payload_from_error(
+        self,
+        *,
+        intent: str,
+        payload: dict[str, Any],
+        error_message: str,
+        user_text: str = "",
+    ) -> dict[str, Any] | None:
+        """Ask the LLM to correct a flat write payload after a Google Health API validation error."""
+        prompt = _user_prompt(
+            llm_time_context(),
+            f"Intent: {intent}",
+            f"User message: {user_text or '(not provided)'}",
+            f"Current payload: {json.dumps(payload, default=str)}",
+            f"Google Health API error: {error_message}",
+        )
+        started = time.perf_counter()
+        try:
+            parsed = self._llm.generate_structured(
+                purpose="fix_health_payload",
+                system_prompt=HEALTH_PAYLOAD_FIX_SYSTEM_PROMPT,
+                user_prompt=prompt,
+                response_model=HealthPayloadFixResponse,
+                temperature=0.1,
+            )
+            if parsed is None or not parsed.payload:
+                record_llm_call(
+                    purpose="fix_health_payload",
+                    model=self._model,
+                    status="empty",
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    prompt={"intent": intent, "payload": payload, "error": error_message},
+                )
+                return None
+            merged = dict(payload)
+            merged.update(parsed.payload)
+            record_llm_call(
+                purpose="fix_health_payload",
+                model=self._model,
+                status="success",
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                prompt={"intent": intent, "payload": payload, "error": error_message},
+                response=parsed.model_dump(),
+            )
+            merged["_fix_summary"] = parsed.fix_summary
+            return merged
+        except Exception as exc:
+            record_llm_call(
+                purpose="fix_health_payload",
+                model=self._model,
+                status="error",
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                prompt={"intent": intent, "payload": payload, "error": error_message},
+                error=str(exc),
+            )
+            logger.exception("Health payload fix error: %s", exc)
+            return None

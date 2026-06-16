@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 WHATSAPP_API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v25.0")
+WHATSAPP_COACH_TEMPLATE = os.getenv("WHATSAPP_COACH_TEMPLATE", "daily_coach_summary")
+WHATSAPP_SESSION_KEEPER_TEMPLATE = os.getenv("WHATSAPP_SESSION_KEEPER_TEMPLATE", "hello_world")
 
 
 def _messages_url() -> str:
@@ -65,6 +67,7 @@ def send_template_message(
     *,
     template_name: str = "hello_world",
     language_code: str = "en_US",
+    body_parameters: list[str] | None = None,
 ) -> dict[str, Any]:
     """Send a pre-approved WhatsApp template (e.g. hello_world)."""
     if not WHATSAPP_ACCESS_TOKEN:
@@ -86,13 +89,65 @@ def send_template_message(
         )
         return {"skipped": True, "reason": "missing_phone_number_id"}
 
+    template_block: dict[str, Any] = {
+        "name": template_name,
+        "language": {"code": language_code},
+    }
+    if body_parameters:
+        template_block["components"] = [
+            {
+                "type": "body",
+                "parameters": [{"type": "text", "text": text[:1024]} for text in body_parameters],
+            }
+        ]
+
     body = {
         "messaging_product": "whatsapp",
         "to": recipient_phone,
         "type": "template",
-        "template": {
-            "name": template_name,
-            "language": {"code": language_code},
+        "template": template_block,
+    }
+    return _post_message(body)
+
+
+def send_coach_summary_template(recipient_phone: str, summary_text: str) -> dict[str, Any]:
+    """Send coach summary via approved template (fallback when 24h window closed)."""
+    snippet = summary_text[:900].strip()
+    if not snippet:
+        snippet = "Your health coach summary is ready. Open WhatsApp to view details."
+    return send_template_message(
+        recipient_phone,
+        template_name=WHATSAPP_COACH_TEMPLATE,
+        body_parameters=[snippet],
+    )
+
+
+def send_interactive_confirm_buttons(
+    recipient_phone: str,
+    *,
+    body_text: str,
+    confirm_id: str = "confirm_log",
+    skip_id: str = "skip_log",
+) -> dict[str, Any]:
+    """Send Confirm / Skip quick-reply buttons for low-confidence nutrition logs."""
+    if not WHATSAPP_ACCESS_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
+        return send_text_message(
+            recipient_phone,
+            f"{body_text}\n\nReply 'yes' to log or 'skip' to cancel.",
+        )
+    body = {
+        "messaging_product": "whatsapp",
+        "to": recipient_phone,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": body_text[:1024]},
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": confirm_id, "title": "Log it"}},
+                    {"type": "reply", "reply": {"id": skip_id, "title": "Skip"}},
+                ]
+            },
         },
     }
     return _post_message(body)
@@ -193,6 +248,18 @@ def extract_incoming_message(body: dict[str, Any]) -> dict[str, Any] | None:
             result["media_id"] = image.get("id")
             result["mime_type"] = image.get("mime_type", "image/jpeg")
             result["caption"] = image.get("caption") or ""
+            return result
+        if message_type == "audio":
+            audio = message.get("audio", {})
+            result["media_id"] = audio.get("id")
+            result["mime_type"] = audio.get("mime_type", "audio/ogg")
+            return result
+        if message_type == "document":
+            document = message.get("document", {})
+            result["media_id"] = document.get("id")
+            result["mime_type"] = document.get("mime_type", "application/pdf")
+            result["filename"] = document.get("filename") or "document"
+            result["caption"] = document.get("caption") or ""
             return result
         return result
     except (IndexError, KeyError, TypeError):

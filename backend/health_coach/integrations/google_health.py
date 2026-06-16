@@ -13,12 +13,18 @@ from datetime import datetime, timezone
 from typing import Any
 
 import requests
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
 from ..core.database import record_google_health_call
 from ..core.timezone import get_user_tz, parse_to_utc, to_civil_filter_literal
-from .google_auth import HEALTH_SCOPES, TOKEN_FILE, load_credentials
+from .google_auth import (
+    HEALTH_SCOPES,
+    TOKEN_FILE,
+    GoogleAuthRequiredError,
+    load_credentials,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +35,7 @@ SUPPORTED_DATA_TYPES = {
     "nutrition-log",
     "hydration-log",
     "weight",
+    "height",
     "sleep",
     "heart-rate",
     "daily-resting-heart-rate",
@@ -42,6 +49,7 @@ FILTER_PREFIX_BY_DATA_TYPE: dict[str, str] = {
     "nutrition-log": "nutrition_log",
     "hydration-log": "hydration_log",
     "weight": "weight",
+    "height": "height",
     "sleep": "sleep",
     "heart-rate": "heart_rate",
     "daily-resting-heart-rate": "daily_resting_heart_rate",
@@ -55,6 +63,7 @@ FILTER_TIME_FIELD_BY_DATA_TYPE: dict[str, str] = {
     "nutrition-log": "interval.civil_start_time",
     "hydration-log": "interval.civil_start_time",
     "weight": "sample_time.physical_time",
+    "height": "sample_time.physical_time",
     "sleep": "interval.end_time",
     "heart-rate": "sample_time.physical_time",
     "daily-resting-heart-rate": "date",
@@ -90,8 +99,14 @@ class GoogleHealthClient:
         creds = self._credentials
         if creds.expired and creds.refresh_token:
             logger.info("Refreshing Google OAuth token before API call.")
-            creds.refresh(Request())
-            TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
+            try:
+                creds.refresh(Request())
+                TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
+            except RefreshError as exc:
+                self._credentials = None
+                raise GoogleAuthRequiredError(
+                    f"Google Health token refresh failed: {exc}"
+                ) from exc
         return creds
 
     def _headers(self) -> dict[str, str]:
@@ -264,6 +279,10 @@ class GoogleHealthClient:
         )
         return result
 
+    def get_profile(self) -> dict[str, Any]:
+        """GET /v4/users/me/profile — age, stride lengths, membership start."""
+        return self._request("GET", "users/me/profile")
+
     def create_data_point(
         self,
         data_type: str,
@@ -292,6 +311,16 @@ class GoogleHealthClient:
         name = f"users/me/dataTypes/{data_type}/dataPoints/{data_point_id}"
         body = {"name": name, **data_point}
         return self._request("PATCH", name, json_body=body)
+
+    def delete_data_point(self, resource_name: str) -> dict[str, Any]:
+        """DELETE /v4/users/me/dataTypes/{dataType}/dataPoints/{id}"""
+        if not resource_name:
+            raise ValueError("resource_name is required for delete")
+        if resource_name.startswith("users/me/"):
+            path = resource_name
+        else:
+            path = resource_name.lstrip("/")
+        return self._request("DELETE", path)
 
     def list_data_points(
         self,

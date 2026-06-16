@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .api.dashboard import router as dashboard_router
+from .api.google_oauth import router as google_oauth_router
 from .api.webhook import router as webhook_router
 from .services.scheduler import start_scheduler, stop_scheduler
 
@@ -54,6 +55,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(dashboard_router)
+app.include_router(google_oauth_router)
 app.include_router(webhook_router)
 
 if FRONTEND_DIST.exists():
