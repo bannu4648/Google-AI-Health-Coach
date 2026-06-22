@@ -188,6 +188,12 @@ def fetch_user_profile_snapshot(
     return dict(snapshot)
 
 
+def invalidate_user_profile_cache() -> None:
+    """Clear cached profile so the next prompt uses fresh weight/height."""
+    global _cache
+    _cache = {"expires_at": 0.0, "snapshot": {}}
+
+
 def format_user_profile_for_prompt(snapshot: dict[str, Any]) -> str:
     """Format profile snapshot for injection into LLM system prompts."""
     lines = [
@@ -198,7 +204,7 @@ def format_user_profile_for_prompt(snapshot: dict[str, Any]) -> str:
     if snapshot.get("height_cm") is not None:
         lines.append(f"- Height: {snapshot['height_cm']} cm")
     if snapshot.get("weight_kg") is not None:
-        lines.append(f"- Latest weight: {snapshot['weight_kg']} kg")
+        lines.append(f"- Latest weight: {snapshot['weight_kg']} kg (used for calorie burn estimates)")
     if snapshot.get("sex"):
         lines.append(f"- Sex: {snapshot['sex']}")
     if snapshot.get("walking_stride_mm") is not None:

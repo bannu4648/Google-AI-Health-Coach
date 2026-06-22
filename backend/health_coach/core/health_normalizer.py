@@ -140,15 +140,29 @@ def _sleep(result: dict[str, Any], data_type: str) -> dict[str, Any]:
     return _base(data_type, result, records, dict(totals))
 
 
+def _active_duration_minutes(active_duration: str | None) -> int | None:
+    if not active_duration:
+        return None
+    text = str(active_duration).strip().rstrip("s")
+    try:
+        return max(1, int(round(float(text) / 60.0)))
+    except (TypeError, ValueError):
+        return None
+
+
 def _exercise(result: dict[str, Any], data_type: str) -> dict[str, Any]:
     records = []
     for point in result.get("dataPoints", []):
         exercise = point.get("exercise", {})
         metrics = exercise.get("metricsSummary", {})
+        interval = exercise.get("interval", {})
         records.append(
             {
-                **_interval_record(exercise.get("interval", {})),
+                **_interval_record(interval),
+                "display_name": exercise.get("displayName"),
                 "exercise_type": exercise.get("exerciseType"),
+                "active_duration_minutes": _active_duration_minutes(exercise.get("activeDuration")),
+                "notes": (exercise.get("notes") or "").strip() or None,
                 "calories_kcal": metrics.get("caloriesKcal"),
                 "distance_m": _safe_div(metrics.get("distanceMillimeters"), 1000),
                 "steps": _safe_int(metrics.get("steps")),

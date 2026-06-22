@@ -126,6 +126,7 @@ def health_overview() -> dict[str, Any]:
                 "evening_summary": scheduler.get("evening_summary_time"),
                 "readiness_nudge": scheduler.get("readiness_nudge_time") or None,
                 "workout_nudge": scheduler.get("workout_nudge_time"),
+                "weight_log_nudge": f"{scheduler.get('weight_log_nudge_day')} {scheduler.get('weight_log_nudge_time')}",
                 "weekly_recap": f"{scheduler.get('weekly_recap_day')} {scheduler.get('weekly_recap_time')}",
             },
             "scheduler_enabled": scheduler.get("enabled") == "true",

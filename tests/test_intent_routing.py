@@ -18,6 +18,20 @@ def test_route_nutrition_lookup_only():
     assert route_after_intent(Intent.QUERY_NUTRITION.value, {"food_display_name": "banana"}) == "lookup_nutrition"
 
 
+def test_route_log_nutrition_with_resolved_macros_executes():
+    payload = {
+        "food_display_name": "linguine",
+        "calories_kcal": 467,
+        "nutrition_resolution": "use_search",
+    }
+    assert route_after_intent(Intent.LOG_NUTRITION.value, payload) == "execute_health"
+
+
+def test_route_log_nutrition_with_router_shorthand_macros_lookups():
+    payload = {"food_display_name": "linguine", "calories_kcal": 467}
+    assert route_after_intent(Intent.LOG_NUTRITION.value, payload) == "lookup_nutrition"
+
+
 def test_route_batch_nutrition():
     payload = {"items": [{"food_display_name": "eggs"}, {"food_display_name": "toast"}]}
     assert route_after_intent(Intent.LOG_NUTRITION.value, payload) == "batch_log_nutrition"

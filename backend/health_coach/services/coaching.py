@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import os
+import time as time_module
 from datetime import datetime, time, timedelta, timezone
 from typing import Any
 
 from ..agent.engine import AIEngine
 from .user_profile import fetch_user_profile_snapshot, format_user_profile_for_prompt
 from ..core.database import add_coach_note, upsert_daily_summary
+from ..core.health_normalizer import normalize_health_result
 from ..core.timezone import (
     enrich_health_api_result_for_llm,
     format_utc_iso,
@@ -26,6 +29,15 @@ from ..services.goal_progress import format_goal_progress_for_summary
 from ..integrations.google_health import GoogleHealthAPIError, GoogleHealthClient
 
 WEEKLY_LOOKBACK_DAYS = 7
+HEALTH_SNAPSHOT_CACHE_SECONDS = int(os.getenv("HEALTH_SNAPSHOT_CACHE_SECONDS", "60"))
+
+_snapshot_cache: dict[str, Any] = {"expires_at": 0.0, "snapshot": {}, "day_key": ""}
+
+
+def clear_health_snapshot_cache() -> None:
+    """Reset in-process daily snapshot cache (tests and post-OAuth refresh)."""
+    global _snapshot_cache
+    _snapshot_cache = {"expires_at": 0.0, "snapshot": {}, "day_key": ""}
 
 
 def local_day_bounds_utc(day: datetime | None = None) -> tuple[str, str]:
@@ -259,7 +271,12 @@ def _fetch_range_metrics(
     rhr_bpm = _extract_resting_hr_bpm(rhr_result)
     azm_minutes = _extract_active_zone_minutes(metrics.get("active_zone_minutes", {}).get("raw", {}))
 
-    metrics["exercise"] = {"count": len(exercise_items), "items": exercise_items}
+    exercise_summary = normalize_health_result("exercise", {"dataPoints": exercise_items})
+    metrics["exercise"] = {
+        "count": len(exercise_items),
+        "items": exercise_items,
+        "sessions": exercise_summary.get("records", []),
+    }
     metrics["sleep"] = {"count": len(sleep_items), "items": sleep_items, **sleep_metrics}
     metrics["heart_rate"] = {
         "sample_count": len(heart_result.get("dataPoints", [])),
@@ -357,14 +374,34 @@ def get_daily_health_snapshot(
     *,
     client: GoogleHealthClient | None = None,
     day: datetime | None = None,
+    force_refresh: bool = False,
 ) -> dict[str, Any]:
     """Today's health metrics (single calendar day in HKT)."""
+    global _snapshot_cache
+    day_key = local_date_str(day)
+    now = time_module.monotonic()
+    if (
+        not force_refresh
+        and HEALTH_SNAPSHOT_CACHE_SECONDS > 0
+        and _snapshot_cache["snapshot"]
+        and _snapshot_cache["day_key"] == day_key
+        and now < _snapshot_cache["expires_at"]
+    ):
+        return dict(_snapshot_cache["snapshot"])
+
     health = client or GoogleHealthClient()
     start, end = local_day_bounds_utc(day)
     snapshot = _fetch_range_metrics(health, start=start, end=end)
-    snapshot["date_hkt"] = local_date_str(day)
+    snapshot["date_hkt"] = day_key
     snapshot["readiness"] = readiness_score(snapshot)
     snapshot["recommendations"] = recommendations(snapshot)
+
+    if HEALTH_SNAPSHOT_CACHE_SECONDS > 0:
+        _snapshot_cache = {
+            "expires_at": now + HEALTH_SNAPSHOT_CACHE_SECONDS,
+            "snapshot": snapshot,
+            "day_key": day_key,
+        }
     return snapshot
 
 

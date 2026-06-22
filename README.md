@@ -11,6 +11,8 @@ Built for personal, single-user use: FastAPI on your machine, `ngrok` for the we
 - **Weekly fitness plans** — co-create text step-by-step workouts stored locally; mark complete and sync to Google Health
 - **Mood & cycle tracking** — stored locally until Google Health API adds Mindfulness / Women's Health (Q3 2026)
 - **Smart nutrition lookup** — Tavily searches USDA, Nutritionix, and other trusted sources before logging calories
+- **Exercise calorie lookup** — Tavily + LLM estimates active burn (personalized to your weight) before workout logging; MET fallback if search is weak
+- **Weekly weight nudge** — WhatsApp reminder to log weight; syncs to Google Health + local history for calorie estimates
 - **Confirm-before-log** — low-confidence nutrition and food photos pause for Confirm/Skip (LangGraph `interrupt()` + WhatsApp buttons)
 - **Undo last log** — `undo` / `UNDO_LAST_LOG` removes the most recent coach-created Google Health entry
 - **Async webhook** — returns 200 immediately; deduplicates Meta retries to prevent duplicate replies
@@ -24,7 +26,7 @@ Built for personal, single-user use: FastAPI on your machine, `ngrok` for the we
 - **Coaching focus** — persistent multi-day thread context (e.g. "help me cut carbs this week")
 - **Goal-aware coaching** — active goals + daily progress injected into every LLM prompt and evening summaries
 - **Rich readiness** — sleep duration/stages, resting HR, active zone minutes (not just step counts)
-- **Scheduled coaching** — morning/evening summaries, readiness nudge, workout adherence nudge, weekly recap
+- **Scheduled coaching** — morning/evening summaries, readiness nudge, workout adherence nudge, weekly weight reminder, weekly recap
 
 ## Google Health Coach parity
 
@@ -89,6 +91,7 @@ flowchart LR
 │   │   ├── google_health.py   # Google Health API v4 client
 │   │   ├── google_auth.py     # OAuth token flow
 │   │   ├── nutrition.py       # Tavily nutrition search
+│   │   ├── exercise.py        # Tavily exercise calorie search
 │   │   ├── research.py        # Tavily general health research
 │   │   └── whatsapp.py        # Meta WhatsApp client + templates/buttons
 │   ├── core/                  # Shared primitives
@@ -161,11 +164,14 @@ The LLM layer is **provider-agnostic** (`backend/health_coach/integrations/llm/`
 
 Default: **Gemini** (`gemini-2.5-flash`). Create a free key at [aistudio.google.com/apikey](https://aistudio.google.com/apikey) and set `GEMINI_API_KEY` in `.env`.
 
+**Automatic failover (Gemini → Mistral):** set `LLM_FALLBACK_PROVIDER=mistral` with both API keys configured. Text routing, nutrition resolution, and summaries fall back to Mistral when Gemini hits rate limits or outages. Food photos and voice notes still use Gemini (Mistral has no vision). Mistral uses its own rate-limit spacing (`MISTRAL_CALL_DELAY_SECONDS`, default `2`).
+
 **Multi-agent flow:**
 - **Vision agent** — analyzes WhatsApp food photos (`agent/vision.py`)
 - **Router agent** — text intent + payload (`agent/engine.py`)
 - **Intent registry** — routes to nutrition / health / research pipelines (`agent/intent_registry.py`)
 - **Nutrition agent** — Tavily lookup + macro resolution (parallel batch via `Send`)
+- **Exercise agent** — Tavily calorie lookup + LLM resolution (personalized to your weight; MET fallback)
 - **Research agent** — sourced general wellness Q&A
 - **Health sync + summarizer** — Google Health API + coach reply
 - **Interrupt/resume** — confirm-before-log pauses graph; next WhatsApp reply resumes
@@ -178,6 +184,9 @@ Rate-limit handling:
 | --- | --- | --- |
 | `LLM_CALL_DELAY_SECONDS` | `0` | Minimum spacing before/after each LLM call (`0` = off; 429 retries still apply) |
 | `LLM_RATE_LIMIT_MAX_RETRIES` | `3` | Retries on HTTP 429 / quota errors |
+| `LLM_FALLBACK_PROVIDER` | _(empty)_ | e.g. `mistral` — failover when primary LLM fails |
+| `MISTRAL_CALL_DELAY_SECONDS` | `2` | Spacing between Mistral calls (recommended on free tier) |
+| `MISTRAL_RATE_LIMIT_MAX_RETRIES` | `3` | Mistral-specific 429 retries |
 | `LLM_RATE_LIMIT_BACKOFF_SECONDS` | `2` | Base delay for exponential backoff (2s → 4s → 8s) |
 
 ### Scheduled coaching
@@ -190,6 +199,8 @@ Set `ENABLE_SCHEDULER=true` and `SUMMARY_RECIPIENT_PHONE` in `.env`:
 | `EVENING_SUMMARY_TIME` | `21:30` | Evening recap (HKT) |
 | `READINESS_NUDGE_TIME` | _(empty)_ | Optional mid-day readiness check |
 | `WORKOUT_NUDGE_TIME` | `18:00` | Nudge if planned workout not logged |
+| `WEIGHT_LOG_NUDGE_DAY` | `mon` | Weekly weigh-in reminder day |
+| `WEIGHT_LOG_NUDGE_TIME` | `09:00` | Weekly weigh-in reminder time (HKT) |
 | `WEEKLY_RECAP_DAY` | `sun` | Weekly recap day |
 | `WEEKLY_RECAP_TIME` | `21:00` | Weekly recap time (HKT) |
 | `WHATSAPP_COACH_TEMPLATE` | `daily_coach_summary` | Meta template for out-of-window delivery |
@@ -232,24 +243,55 @@ WHATSAPP_VERIFY_TOKEN=replace-me
 WHATSAPP_API_VERSION=v25.0
 ```
 
-Expose your local backend with ngrok:
+WhatsApp needs a **public HTTPS URL**. Run **both** the backend and ngrok — if either stops, inbound messages are lost (Meta does not reliably retry).
+
+**Option A — one command (recommended):**
 
 ```bash
+chmod +x scripts/start-stack.sh && ./scripts/start-stack.sh
+```
+
+This starts FastAPI on port 8000 and `ngrok http 8000`, then prints your public URL and webhook path.
+
+**Option B — two terminals:**
+
+```bash
+# Terminal 1 — backend (must stay running)
+python3 -m uvicorn backend.health_coach.app:app --host 0.0.0.0 --port 8000
+
+# Terminal 2 — ngrok (must stay running)
 ngrok http 8000
 ```
 
-Set your Meta webhook callback URL to `https://<ngrok-domain>/webhook`.
+Copy the `https://….ngrok-free.dev` URL from the ngrok dashboard (`http://127.0.0.1:4040`) and set in `.env`:
+
+```bash
+PUBLIC_BASE_URL=https://your-subdomain.ngrok-free.dev
+```
+
+Set your Meta webhook callback URL to `https://<ngrok-domain>/webhook` (same host as `PUBLIC_BASE_URL`).
+
+**Verify both are up:**
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8000/docs    # expect 200
+curl -s -o /dev/null -w "%{http_code}\n" "$PUBLIC_BASE_URL/docs"       # expect 200
+```
+
+If ngrok shows `502 Bad Gateway`, the backend is down — restart it. Scheduled nudges (morning summary, readiness check-in, workout reminder) also require the backend process to be running at the scheduled HKT time.
+
+**Keep running overnight:** use `nohup` / `tmux` / `launchd`, or run `./scripts/start-stack.sh` after reboot. On a Mac mini, consider a simple `launchd` plist so backend + ngrok restart automatically.
 
 ### 5. Run locally
 
 ```bash
-# Backend
-python3 -m uvicorn backend.health_coach.app:app --host 0.0.0.0 --port 8000
+# Backend + ngrok (WhatsApp)
+./scripts/start-stack.sh
 
 # Dashboard (separate terminal)
 cd frontend && npm run dev
 
-# Or both at once
+# Backend + dashboard only (no WhatsApp tunnel)
 chmod +x scripts/dev.sh && ./scripts/dev.sh
 ```
 

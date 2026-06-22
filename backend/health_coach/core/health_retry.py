@@ -77,6 +77,19 @@ def apply_deterministic_payload_fixes(
             fixed["exercise_type"] = "CARDIO_WORKOUT"
             changed = True
 
+    if intent in {"LOG_EXERCISE", "UPDATE_EXERCISE"} and (
+        "activeenergy" in lowered
+        or ("metrics_summary" in lowered and "unknown name" in lowered)
+    ):
+        calories = fixed.get("calories_kcal")
+        if calories is None and isinstance(fixed.get("data_point"), dict):
+            metrics = (fixed["data_point"].get("exercise") or {}).get("metricsSummary") or {}
+            calories = (metrics.get("activeEnergy") or {}).get("kcal") or metrics.get("caloriesKcal")
+        if calories:
+            fixed["calories_kcal"] = calories
+            changed = True
+        fixed.pop("data_point", None)
+
     if intent == "LOG_HYDRATION" and "unit" in lowered:
         unit = str(fixed.get("unit") or "").upper()
         if unit not in {"MILLILITER", "CUP_US", "FLUID_OUNCE_US"}:

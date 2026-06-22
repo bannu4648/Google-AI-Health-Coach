@@ -20,6 +20,7 @@ from ..integrations.whatsapp import (
 )
 from .coaching import create_daily_summary, create_weekly_recap
 from .fitness_plans import get_todays_workout
+from .memory import record_coach_outreach
 
 load_dotenv()
 
@@ -31,6 +32,8 @@ EVENING_SUMMARY_TIME = os.getenv("EVENING_SUMMARY_TIME", "21:30")
 SUMMARY_RECIPIENT_PHONE = os.getenv("SUMMARY_RECIPIENT_PHONE", "")
 READINESS_NUDGE_TIME = os.getenv("READINESS_NUDGE_TIME", "")
 WORKOUT_NUDGE_TIME = os.getenv("WORKOUT_NUDGE_TIME", "18:00")
+WEIGHT_LOG_NUDGE_DAY = os.getenv("WEIGHT_LOG_NUDGE_DAY", "mon").lower()
+WEIGHT_LOG_NUDGE_TIME = os.getenv("WEIGHT_LOG_NUDGE_TIME", "09:00")
 WEEKLY_RECAP_DAY = os.getenv("WEEKLY_RECAP_DAY", "sun").lower()
 WEEKLY_RECAP_TIME = os.getenv("WEEKLY_RECAP_TIME", "21:00")
 SESSION_KEEPER_HOURS = int(os.getenv("SESSION_KEEPER_HOURS", "20"))
@@ -59,7 +62,7 @@ def _parse_hhmm(value: str) -> tuple[int, int]:
     return hour, minute
 
 
-def _send_with_template_fallback(phone: str, message: str) -> dict:
+def _send_with_template_fallback(phone: str, message: str, *, job: str = "") -> dict:
     result = send_text_message(phone, message)
     if result.get("error"):
         template = send_coach_summary_template(phone, message)
@@ -69,6 +72,7 @@ def _send_with_template_fallback(phone: str, message: str) -> dict:
                 template_name=WHATSAPP_SESSION_KEEPER_TEMPLATE,
             )
         return {"text_result": result, "template_result": template}
+    record_coach_outreach(phone, text=message, source=job or "scheduler")
     return {"text_result": result}
 
 
@@ -98,7 +102,11 @@ def run_readiness_nudge_job() -> dict:
             f"({readiness.get('label', 'steady')}). "
             + " ".join(snapshot.get("recommendations", [])[:2])
         )
-        send_result = _send_with_template_fallback(SUMMARY_RECIPIENT_PHONE, message)
+        send_result = _send_with_template_fallback(
+            SUMMARY_RECIPIENT_PHONE,
+            message,
+            job="readiness_nudge",
+        )
         result = {"snapshot": snapshot, "message": message, "send_result": send_result}
         record_job_run(
             job_name="readiness_nudge",
@@ -141,7 +149,11 @@ def run_workout_adherence_nudge_job() -> dict:
             f"Workout reminder: {today_workout.get('title', 'session')} is on your plan today.\n"
             f"{format_workout_for_reply(today_workout)}"
         )
-        send_result = _send_with_template_fallback(SUMMARY_RECIPIENT_PHONE, message)
+        send_result = _send_with_template_fallback(
+            SUMMARY_RECIPIENT_PHONE,
+            message,
+            job="workout_adherence_nudge",
+        )
         result = {"message": message, "send_result": send_result}
         record_job_run(
             job_name="workout_adherence_nudge",
@@ -163,13 +175,55 @@ def run_workout_adherence_nudge_job() -> dict:
         return {"error": True, "message": str(exc)}
 
 
+def run_weekly_weight_nudge_job() -> dict:
+    """Remind user to log weight if none recorded in the past week."""
+    started = utc_now_iso()
+    try:
+        if not SUMMARY_RECIPIENT_PHONE:
+            raise RuntimeError("SUMMARY_RECIPIENT_PHONE is not set")
+        from .weight_tracking import build_weight_nudge_message, should_send_weekly_weight_nudge
+
+        if not should_send_weekly_weight_nudge():
+            return {"skipped": True, "reason": "weight_logged_recently"}
+
+        message = build_weight_nudge_message()
+        send_result = _send_with_template_fallback(
+            SUMMARY_RECIPIENT_PHONE,
+            message,
+            job="weekly_weight_nudge",
+        )
+        result = {"message": message, "send_result": send_result}
+        record_job_run(
+            job_name="weekly_weight_nudge",
+            status="success",
+            started_at=started,
+            finished_at=utc_now_iso(),
+            result=result,
+        )
+        return result
+    except Exception as exc:
+        logger.exception("Weekly weight nudge failed: %s", exc)
+        record_job_run(
+            job_name="weekly_weight_nudge",
+            status="error",
+            started_at=started,
+            finished_at=utc_now_iso(),
+            error=str(exc),
+        )
+        return {"error": True, "message": str(exc)}
+
+
 def run_weekly_recap_job() -> dict:
     started = utc_now_iso()
     try:
         if not SUMMARY_RECIPIENT_PHONE:
             raise RuntimeError("SUMMARY_RECIPIENT_PHONE is not set")
         recap = create_weekly_recap()
-        send_result = _send_with_template_fallback(SUMMARY_RECIPIENT_PHONE, recap["message"])
+        send_result = _send_with_template_fallback(
+            SUMMARY_RECIPIENT_PHONE,
+            recap["message"],
+            job="weekly_recap",
+        )
         result = {**recap, "send_result": send_result}
         record_job_run(
             job_name="weekly_recap",
@@ -201,6 +255,7 @@ def run_summary_job(summary_type: str) -> dict:
         send_result = _send_with_template_fallback(
             SUMMARY_RECIPIENT_PHONE,
             summary["message"],
+            job=f"{summary_type}_summary",
         )
         result = {**summary, "send_result": send_result}
         record_job_run(
@@ -229,6 +284,8 @@ def get_scheduler_config() -> dict[str, str]:
         "evening_summary_time": EVENING_SUMMARY_TIME,
         "readiness_nudge_time": READINESS_NUDGE_TIME or "",
         "workout_nudge_time": WORKOUT_NUDGE_TIME,
+        "weight_log_nudge_day": WEIGHT_LOG_NUDGE_DAY,
+        "weight_log_nudge_time": WEIGHT_LOG_NUDGE_TIME,
         "weekly_recap_day": WEEKLY_RECAP_DAY,
         "weekly_recap_time": WEEKLY_RECAP_TIME,
         "enabled": str(ENABLE_SCHEDULER).lower(),
@@ -290,6 +347,23 @@ def start_scheduler() -> BackgroundScheduler | None:
             )
         except ValueError as exc:
             logger.warning("Invalid WORKOUT_NUDGE_TIME %r: %s", WORKOUT_NUDGE_TIME, exc)
+    weight_dow = _DAY_MAP.get(WEIGHT_LOG_NUDGE_DAY, 0)
+    if WEIGHT_LOG_NUDGE_TIME.strip():
+        try:
+            weight_hour, weight_minute = _parse_hhmm(WEIGHT_LOG_NUDGE_TIME.strip())
+            scheduler.add_job(
+                run_weekly_weight_nudge_job,
+                CronTrigger(
+                    day_of_week=weight_dow,
+                    hour=weight_hour,
+                    minute=weight_minute,
+                    timezone=get_user_tz(),
+                ),
+                id="weekly_weight_nudge",
+                replace_existing=True,
+            )
+        except ValueError as exc:
+            logger.warning("Invalid WEIGHT_LOG_NUDGE_TIME %r: %s", WEIGHT_LOG_NUDGE_TIME, exc)
     weekly_dow = _DAY_MAP.get(WEEKLY_RECAP_DAY, 6)
     try:
         recap_hour, recap_minute = _parse_hhmm(WEEKLY_RECAP_TIME)
@@ -310,11 +384,13 @@ def start_scheduler() -> BackgroundScheduler | None:
     scheduler.start()
     _scheduler = scheduler
     logger.info(
-        "Scheduler started at %s with morning=%s evening=%s workout_nudge=%s",
+        "Scheduler started at %s with morning=%s evening=%s workout_nudge=%s weight_nudge=%s %s",
         datetime.now(get_user_tz()).isoformat(),
         MORNING_SUMMARY_TIME,
         EVENING_SUMMARY_TIME,
         WORKOUT_NUDGE_TIME,
+        WEIGHT_LOG_NUDGE_DAY,
+        WEIGHT_LOG_NUDGE_TIME,
     )
     return scheduler
 

@@ -11,9 +11,13 @@ from .user_goals import fetch_active_goals
 from .wellness_logs import fetch_recent_moods
 
 
-def build_coach_state_snapshot(*, client: GoogleHealthClient | None = None) -> dict[str, Any]:
+def build_coach_state_snapshot(
+    *,
+    client: GoogleHealthClient | None = None,
+    health_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     plan = get_relevant_active_plan()
-    goals = enrich_goals_with_progress(client=client)
+    goals = enrich_goals_with_progress(client=client, snapshot=health_snapshot)
     moods = fetch_recent_moods(limit=1)
 
     plan_summary = "No active fitness plan."
@@ -55,8 +59,9 @@ def format_coach_state_for_prompt(
     snapshot: dict[str, Any] | None = None,
     *,
     client: GoogleHealthClient | None = None,
+    health_snapshot: dict[str, Any] | None = None,
 ) -> str:
-    data = snapshot or build_coach_state_snapshot(client=client)
+    data = snapshot or build_coach_state_snapshot(client=client, health_snapshot=health_snapshot)
     return (
         "COACH MEMORY (local SQLite — use QUERY_FITNESS_PLAN or QUERY_COACH_DATA for details):\n"
         f"Fitness plan: {data.get('plan_summary', '')}\n"

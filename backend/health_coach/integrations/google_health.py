@@ -312,15 +312,39 @@ class GoogleHealthClient:
         body = {"name": name, **data_point}
         return self._request("PATCH", name, json_body=body)
 
+    @staticmethod
+    def _normalize_resource_path(resource_name: str) -> str:
+        """Map users/{numericId}/... resource names to users/me/... for writes/deletes."""
+        path = resource_name.lstrip("/")
+        if path.startswith("users/me/"):
+            return path
+        parts = path.split("/")
+        if len(parts) >= 3 and parts[0] == "users" and parts[1] != "me":
+            return "users/me/" + "/".join(parts[2:])
+        return path
+
     def delete_data_point(self, resource_name: str) -> dict[str, Any]:
-        """DELETE /v4/users/me/dataTypes/{dataType}/dataPoints/{id}"""
+        """Delete a single data point via batchDelete (API does not support HTTP DELETE)."""
         if not resource_name:
             raise ValueError("resource_name is required for delete")
-        if resource_name.startswith("users/me/"):
-            path = resource_name
-        else:
-            path = resource_name.lstrip("/")
-        return self._request("DELETE", path)
+        return self.batch_delete_data_points([resource_name])
+
+    def batch_delete_data_points(self, resource_names: list[str]) -> dict[str, Any]:
+        """POST .../dataPoints:batchDelete — up to 10,000 names per request."""
+        if not resource_names:
+            raise ValueError("resource_names is required")
+        names = [name.lstrip("/") for name in resource_names if name]
+        if not names:
+            raise ValueError("resource_names is required")
+        parts = names[0].split("/")
+        if len(parts) < 4 or parts[2] != "dataTypes":
+            raise ValueError(f"Invalid resource name: {names[0]}")
+        parent = f"users/me/dataTypes/{parts[3]}"
+        return self._request(
+            "POST",
+            f"{parent}/dataPoints:batchDelete",
+            json_body={"names": names},
+        )
 
     def list_data_points(
         self,

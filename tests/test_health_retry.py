@@ -62,3 +62,30 @@ def test_create_data_point_with_retry_raises_when_not_retryable():
             {"food_display_name": "x", "meal_type": "DINNER"},
             client=client,
         )
+
+
+def test_create_exercise_retry_fixes_active_energy_field():
+    client = MagicMock()
+    client.create_data_point.side_effect = [
+        GoogleHealthAPIError(
+            400,
+            'Unknown name "activeEnergy" at \'data_point.exercise.metrics_summary\'',
+        ),
+        {"name": "users/me/dataTypes/exercise/dataPoints/xyz"},
+    ]
+    payload = {
+        "display_name": "Bodyweight Squats",
+        "exercise_type": "STRENGTH_TRAINING",
+        "duration_minutes": 6,
+        "data_point": {
+            "exercise": {
+                "displayName": "Bodyweight Squats",
+                "metricsSummary": {"activeEnergy": {"kcal": 50}},
+            }
+        },
+    }
+    result = _create_data_point_with_retry(Intent.LOG_EXERCISE, payload, client=client)
+    assert "xyz" in result["name"]
+    assert client.create_data_point.call_count == 2
+    second_call_body = client.create_data_point.call_args_list[1].args[1]
+    assert second_call_body["exercise"]["metricsSummary"]["caloriesKcal"] == 50

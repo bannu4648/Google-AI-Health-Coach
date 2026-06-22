@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..core.database import add_coach_note
+from ..core.payloads import parse_active_duration_minutes
 from ..core.timezone import default_query_range_utc, now_local
 from ..integrations.google_health import GoogleHealthAPIError, GoogleHealthClient
 from .fitness_plans import format_full_plan_for_reply, get_relevant_active_plan
@@ -30,12 +31,19 @@ def _compact_exercise(items: list[dict[str, Any]], *, limit: int = 20) -> list[d
     compact: list[dict[str, Any]] = []
     for item in items[:limit]:
         exercise = item.get("exercise", {})
+        metrics = exercise.get("metricsSummary") or {}
+        interval = exercise.get("interval") or {}
+        duration = exercise.get("durationMinutes") or exercise.get("duration_minutes")
+        if duration is None:
+            duration = parse_active_duration_minutes(exercise.get("activeDuration"))
         compact.append(
             {
                 "name": exercise.get("displayName") or exercise.get("display_name"),
                 "type": exercise.get("exerciseType") or exercise.get("exercise_type"),
-                "duration_minutes": exercise.get("durationMinutes") or exercise.get("duration_minutes"),
-                "logged_at": item.get("interval", {}).get("startTime"),
+                "duration_minutes": duration,
+                "calories_kcal": metrics.get("caloriesKcal"),
+                "notes": (exercise.get("notes") or "").strip() or None,
+                "logged_at": interval.get("startTime") or item.get("interval", {}).get("startTime"),
             }
         )
     return compact

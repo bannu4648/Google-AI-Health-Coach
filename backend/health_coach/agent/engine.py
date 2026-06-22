@@ -18,7 +18,7 @@ from enum import Enum
 from typing import Any
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from ..core.types import DATA_TYPE_PROMPT_LIST, normalize_query_payload
 from ..core.database import record_llm_call
@@ -59,6 +59,7 @@ class Intent(str, Enum):
     QUERY_SLEEP = "QUERY_SLEEP"
     COACHING_CHAT = "COACHING_CHAT"
     UNDO_LAST_LOG = "UNDO_LAST_LOG"
+    DELETE_NUTRITION = "DELETE_NUTRITION"
 
 
 GOOGLE_HEALTH_QUERY_INTENTS = {
@@ -139,6 +140,7 @@ Return JSON with:
 Rules:
 - meal_type must be one of: MEAL_TYPE_UNSPECIFIED, BREAKFAST, LUNCH, DINNER, SNACK, BEFORE_BREAKFAST, BEFORE_LUNCH, BEFORE_DINNER, AFTER_DINNER, ANYTIME
 - exercise_type must be a valid Exercise.ExerciseType enum value (e.g. RUNNING, STRENGTH_TRAINING, HIIT, WALKING, BIKING, CARDIO_WORKOUT)
+- calories_kcal maps to metricsSummary.caloriesKcal on exercise writes — never use activeEnergy
 - hydration unit: MILLILITER, CUP_US, or FLUID_OUNCE_US
 - Do not remove required fields like food_display_name, display_name, calories_kcal when present
 - Only change fields implicated by the API error or clearly invalid
@@ -171,7 +173,10 @@ class ResearchResponse(BaseModel):
 
 class NutritionMacrosResponse(BaseModel):
     resolution: str = Field(
-        description="use_search when Tavily data is reliable; educated_guess when search failed but you can estimate; ask_followup when portion/food is too ambiguous to log"
+        description=(
+            "use_search when Tavily data is reliable; educated_guess when search failed; "
+            "ask_followup when too ambiguous; user_stated when the user gave explicit macros"
+        )
     )
     calories_kcal: int | None = None
     protein_grams: float | None = None
@@ -187,12 +192,108 @@ class NutritionMacrosResponse(BaseModel):
     followup_question: str = ""
     notes: str = ""
 
+    @field_validator(
+        "resolution",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_resolution(cls, value: Any) -> str:
+        return str(value or "").strip().lower()
+
+    @field_validator(
+        "source_url",
+        "nutrition_source",
+        "nutrition_reply",
+        "followup_question",
+        "notes",
+        "sanity_check",
+        "confidence",
+        "food_display_name",
+        mode="before",
+    )
+    @classmethod
+    def _none_to_empty_str(cls, value: Any) -> str:
+        return "" if value is None else str(value)
+
+    @field_validator("source_urls", mode="before")
+    @classmethod
+    def _none_to_empty_list(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        return list(value)
+
+    @field_validator("calories_kcal", mode="before")
+    @classmethod
+    def _coerce_calories_kcal(cls, value: Any) -> int | None:
+        if value is None or value == "":
+            return None
+        return int(round(float(value)))
+
+    @field_validator("protein_grams", "carbs_grams", "fat_grams", mode="before")
+    @classmethod
+    def _coerce_macro_float(cls, value: Any) -> float | None:
+        if value is None or value == "":
+            return None
+        return float(value)
+
     @model_validator(mode="after")
     def validate_resolution_fields(self) -> "NutritionMacrosResponse":
         if self.resolution == "ask_followup":
             return self
         if self.calories_kcal is None:
             raise ValueError("calories_kcal is required unless resolution is ask_followup")
+        return self
+
+
+class ExerciseCaloriesResponse(BaseModel):
+    resolution: str = Field(
+        description="use_search when Tavily data is reliable; met_estimate when using MET formula with user weight; educated_guess when search failed"
+    )
+    calories_kcal: int | None = None
+    exercise_source: str = ""
+    source_url: str = ""
+    source_urls: list[str] = Field(default_factory=list)
+    confidence: str = "low"
+    sanity_check: str = ""
+    exercise_reply: str = ""
+    notes: str = ""
+
+    @field_validator("resolution", mode="before")
+    @classmethod
+    def _normalize_resolution(cls, value: Any) -> str:
+        return str(value or "").strip().lower()
+
+    @field_validator(
+        "source_url",
+        "exercise_source",
+        "exercise_reply",
+        "notes",
+        "sanity_check",
+        "confidence",
+        mode="before",
+    )
+    @classmethod
+    def _none_to_empty_str(cls, value: Any) -> str:
+        return "" if value is None else str(value)
+
+    @field_validator("source_urls", mode="before")
+    @classmethod
+    def _none_to_empty_list(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        return list(value)
+
+    @field_validator("calories_kcal", mode="before")
+    @classmethod
+    def _coerce_calories_kcal(cls, value: Any) -> int | None:
+        if value is None or value == "":
+            return None
+        return int(round(float(value)))
+
+    @model_validator(mode="after")
+    def validate_calories(self) -> "ExerciseCaloriesResponse":
+        if self.calories_kcal is None:
+            raise ValueError("calories_kcal is required")
         return self
 
 
@@ -264,13 +365,20 @@ Return JSON with exactly these keys:
 - payload
 - conversational_reply
 
-Valid intents: LOG_NUTRITION, UPDATE_NUTRITION, QUERY_NUTRITION, GENERAL_RESEARCH, LOG_HYDRATION, LOG_WEIGHT,
+Valid intents: LOG_NUTRITION, UPDATE_NUTRITION, DELETE_NUTRITION, QUERY_NUTRITION, GENERAL_RESEARCH, LOG_HYDRATION, LOG_WEIGHT,
 LOG_EXERCISE, UPDATE_EXERCISE, CREATE_FITNESS_PLAN, QUERY_FITNESS_PLAN, COMPLETE_WORKOUT,
 LOG_MOOD, QUERY_MOOD_HISTORY, LOG_CYCLE, QUERY_CYCLE, QUERY_COACH_DATA,
 LOG_GOAL, UPDATE_GOAL, QUERY_GOALS, BUILD_WELLNESS_PLAN, SUMMARIZE_DOCUMENT,
 QUERY_HISTORY, QUERY_TRENDS, QUERY_SLEEP, COACHING_CHAT, UNDO_LAST_LOG
 
 Use recent conversation context when the user is correcting or following up on a prior log.
+
+SCHEDULED NUDGES — same conversation thread:
+Proactive messages labeled "Coach (scheduled)" (workout reminders, morning/evening summaries, weekly recap)
+are part of the same WhatsApp thread. When the user replies to those messages — e.g. "the gym is closed",
+"give me indoor alternatives", "something I can do at home after dinner" — use COACHING_CHAT and give
+practical workout alternatives grounded in their plan and readiness. Do NOT treat these as unrelated new topics
+or re-open an old nutrition lookup unless they clearly switch to food logging.
 
 COACH MEMORY in the user message block summarizes local SQLite state (plans, goals, mood).
 For "give me my plan" or today's workout -> QUERY_FITNESS_PLAN (deterministic, no SQL).
@@ -319,6 +427,7 @@ Routing:
 - Weekly trends/averages -> QUERY_TRENDS
 - Sleep -> QUERY_SLEEP
 - Undo last log -> UNDO_LAST_LOG (payload: optional data_type hint)
+- Delete duplicate/wrong meal logs -> DELETE_NUTRITION (see payload below)
 - General chat -> COACHING_CHAT with empty payload object
 
 GLOBAL no-log rule:
@@ -379,21 +488,35 @@ portion_description (include only if the user changes quantity/food, not for tim
 logged_at_hkt (corrected local HKT time, required for time corrections),
 meal_type (optional — omit if unchanged)
 
+For multiple meal corrections in one message, use items[] with one object per meal
+(food_display_name + logged_at_hkt + optional meal_type each). Cap at 8 items.
+
 Do NOT include calories_kcal or macros unless the user explicitly provides corrected numbers.
 For time-only corrections, omit portion_description and all macro fields.
 
-IMPORTANT: Do NOT convert HKT to UTC yourself for logged_at_hkt. Python handles conversion.
+DELETE_NUTRITION payload:
+match_keywords (array of substrings, e.g. ["pasta", "linguine"] — matches food_display_name),
+keep_display_name (which entry to keep, substring match — required unless delete_all_matches is true),
+date_hkt (optional YYYY-MM-DD — limit to that calendar day in HKT; default last 3 days),
+keep_logged_at_hkt (optional — prefer keeper with this local time if multiple match keep_display_name),
+delete_all_matches (optional boolean — delete every match on date_hkt; omit keep_display_name)
+
+Use delete_all_matches when removing a single mistaken/phantom entry.
+Use DELETE_NUTRITION when user asks to remove/delete duplicate meals — NOT UPDATE_NUTRITION.
 Never append Z to logged_at_hkt.
 
 LOG_HYDRATION payload:
 milliliters (convert oz/cups to mL), unit (MILLILITER|CUP_US|FLUID_OUNCE_US), logged_at_hkt (optional)
 
 LOG_WEIGHT payload:
-weight_grams (convert lb/kg to grams), notes (optional), logged_at_hkt (optional)
+weight_grams (convert lb/kg to grams — e.g. 76 kg = 76000), notes (optional), logged_at_hkt (optional)
+When user gives weight in kg, convert to grams. Weekly weigh-ins update Google Health and coach memory.
 
 LOG_EXERCISE payload:
 display_name (required), exercise_type (e.g. RUNNING, STRENGTH_TRAINING, HIIT, YOGA, WALKING, BIKING),
-duration_minutes (required when mentioned), logged_at_hkt (optional), notes (optional), calories_kcal (optional estimate)
+duration_minutes (required when mentioned), logged_at_hkt (optional), notes (optional), calories_kcal (optional — Tavily + profile lookup runs if omitted)
+For multiple distinct exercises in one message, use items[] with display_name + duration_minutes per exercise; otherwise one combined session with notes listing the workout.
+Do NOT include calories_kcal for LOG_EXERCISE — Tavily exercise lookup resolves burn after routing.
 
 UPDATE_EXERCISE payload:
 display_name (from conversation), duration_minutes (optional), logged_at_hkt (optional for time fixes), notes (optional)
@@ -493,6 +616,8 @@ For QUERY_NUTRITION, say you'll look up trusted sources and share the numbers (n
 For QUERY_FITNESS_PLAN and QUERY_COACH_DATA, conversational_reply must be a short acknowledgment only — never list workout steps or invent plan details.
 Do not quote calorie numbers in conversational_reply for nutrition intents — macros and source links are filled in later.
 conversational_reply should be warm, concise, and use HKT when mentioning times.
+When the user logs food or asks about eating, reference NUTRITION PLAN targets in coach memory if present.
+After meal logs, the system may append today's calorie/protein progress — keep conversational_reply short.
 """.replace("{data_types}", DATA_TYPE_PROMPT_LIST).replace("{coach_db_schema}", COACH_DB_SCHEMA)
 
 NUTRITION_RESOLVE_SYSTEM_PROMPT = """You resolve nutrition macros using Tavily web search results.
@@ -503,7 +628,7 @@ The user message includes a mode:
 
 The search targets trusted nutrition databases (USDA, Nutritionix, MyFitnessPal, CalorieKing, etc.).
 Return JSON with exactly these keys:
-- resolution ("use_search", "educated_guess", or "ask_followup")
+- resolution ("use_search", "educated_guess", "ask_followup", or "user_stated")
 - calories_kcal (integer, omit/null only when resolution is ask_followup)
 - protein_grams (number, omit/null only when resolution is ask_followup)
 - carbs_grams (number, omit/null only when resolution is ask_followup)
@@ -538,6 +663,12 @@ Resolution rules:
    - Do NOT provide calories_kcal or macros (leave null).
    - nutrition_reply MUST explain that online lookup was insufficient and ask one clear follow-up question.
    - Put the question in both followup_question and nutrition_reply.
+   - NEVER use ask_followup when the user explicitly stated calories and/or protein in their message — use user_stated instead.
+
+4. user_stated — the user gave explicit calories and/or macros in their message (e.g. "650 calories", "48g protein"):
+   - Use those numbers even if Tavily suggests different values for a generic product.
+   - Estimate missing carbs/fat only when needed to complete the log.
+   - nutrition_reply should confirm you used their numbers and invite correction.
 
 General rules:
 - Prefer USDA and major nutrition databases over blogs or forums.
@@ -546,6 +677,35 @@ General rules:
 - Treat Tavily's synthesized answer as secondary. If the answer conflicts with source snippets,
   trust the source snippets/URLs and explain the sane value in sanity_check.
 - nutrition_reply should be warm, concise, and under 600 characters.
+"""
+
+EXERCISE_RESOLVE_SYSTEM_PROMPT = """You estimate active calories burned during exercise using Tavily web search results and the USER PROFILE.
+
+Return JSON with exactly these keys:
+- resolution ("use_search", "met_estimate", or "educated_guess")
+- calories_kcal (integer — active calories for the full session)
+- exercise_source (short source label; empty for met_estimate/educated_guess unless a URL backs it)
+- source_url (full https URL from Tavily when resolution is use_search)
+- source_urls (up to 3 https URLs from Tavily you relied on)
+- confidence ("high", "medium", or "low")
+- sanity_check (1 short sentence: does this burn make sense for duration, exercise type, and user weight?)
+- exercise_reply (WhatsApp-ready note about the calorie estimate; plain text, no markdown; under 400 chars)
+- notes (brief assumptions — e.g. moderate intensity; empty if none)
+
+Resolution rules:
+1. use_search — Tavily returned usable calorie/MET data for this exercise and duration:
+   - Personalize using user weight from USER PROFILE when the source gives per-kg or MET values.
+   - exercise_reply MUST include ~kcal and a full https source URL when available.
+2. met_estimate — Tavily weak but duration + exercise type + user weight allow a MET-based estimate:
+   - Use standard MET values (strength ~5, walking ~3.5, running ~9.8, HIIT ~8).
+   - Say honestly it is a formula estimate in exercise_reply.
+3. educated_guess — sparse data; give a conservative estimate from exercise type and duration.
+
+General rules:
+- Never fabricate URLs — copy exactly from Tavily results.
+- Prefer Healthline, Harvard, ACE, ExRx, and calculator sites over random blogs.
+- For combined workouts with multiple moves in notes, estimate total session burn, not per rep.
+- Round calories_kcal to a sensible integer.
 """
 
 SUMMARIZE_SYSTEM_PROMPT = """You are a premium wellness coach replying on WhatsApp to a user in Hong Kong.
@@ -649,7 +809,11 @@ class AIEngine:
             rate_limit_max_retries=rate_limit_max_retries,
             rate_limit_backoff_seconds=rate_limit_backoff_seconds,
         )
-        self._model = self._llm.model_name
+
+    @property
+    def _model(self) -> str:
+        """Model id for llm_calls logging (updates when failover switches provider)."""
+        return self._llm.model_name
 
     @property
     def llm(self) -> LLMProvider:
@@ -794,22 +958,50 @@ class AIEngine:
         )
         started = time.perf_counter()
         try:
-            parsed = self._llm.generate_structured(
+            raw_parsed = self._llm.generate_json(
                 purpose="resolve_nutrition_macros",
                 system_prompt=_system_prompt(NUTRITION_RESOLVE_SYSTEM_PROMPT, user_profile_context),
                 user_prompt=prompt,
-                response_model=NutritionMacrosResponse,
                 temperature=0.1,
             )
+            try:
+                parsed = NutritionMacrosResponse.model_validate(raw_parsed)
+            except (json.JSONDecodeError, ValidationError, ValueError) as exc:
+                record_llm_call(
+                    purpose="resolve_nutrition_macros",
+                    model=self._model,
+                    status="parse_error",
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    prompt={"user_text": user_text, "payload": payload, "search_result": search_result},
+                    response={"raw": raw_parsed},
+                    error=str(exc),
+                )
+                logger.exception("Nutrition macro parse error: %s", exc)
+                parsed = None
             if parsed is None:
+                lookup_only = intent == Intent.QUERY_NUTRITION.value
                 record_llm_call(
                     purpose="resolve_nutrition_macros",
                     model=self._model,
                     status="empty",
                     latency_ms=int((time.perf_counter() - started) * 1000),
                     prompt={"user_text": user_text, "payload": payload, "search_result": search_result},
+                    response={"raw": raw_parsed} if "raw_parsed" in locals() else {},
                 )
-                return payload
+                return {
+                    **payload,
+                    "nutrition_resolution": "ask_followup",
+                    "nutrition_lookup_only": lookup_only,
+                    "nutrition_reply": (
+                        "I couldn't resolve nutrition numbers for that meal just now. "
+                        + (
+                            "Say 'log it' once you're happy with an estimate, "
+                            "or describe the portion size."
+                            if lookup_only
+                            else "Nothing was logged — try again or share portion details."
+                        )
+                    ),
+                }
             merged = dict(payload)
             merged.update(
                 {
@@ -835,6 +1027,13 @@ class AIEngine:
                         "fat_grams": parsed.fat_grams,
                     }
                 )
+            from ..integrations.nutrition import apply_user_stated_macros
+
+            merged = apply_user_stated_macros(
+                merged,
+                user_text=user_text,
+                item_context=bool(payload.get("_batch_item")),
+            )
             record_llm_call(
                 purpose="resolve_nutrition_macros",
                 model=self._model,
@@ -855,6 +1054,96 @@ class AIEngine:
             )
             logger.exception("Nutrition macro resolve error: %s", exc)
             return payload
+
+    def resolve_exercise_calories(
+        self,
+        *,
+        user_text: str,
+        payload: dict[str, Any],
+        search_result: dict[str, Any],
+        conversation_context: str = "",
+        user_profile_context: str = "",
+        weight_kg: float | None = None,
+    ) -> dict[str, Any]:
+        """Fill calories_kcal from Tavily search + user profile before exercise logging."""
+        from ..integrations.exercise import format_tavily_source_links
+        from ..integrations.nutrition import search_has_usable_results
+        from ..core.payloads import enrich_exercise_log_payload, estimate_exercise_calories_kcal
+
+        usable = search_has_usable_results(search_result)
+        prompt = _user_prompt(
+            llm_time_context(),
+            conversation_context,
+            f"User message: {user_text}",
+            f"Extracted exercise fields: {json.dumps(payload, default=str)}",
+            f"User weight for MET math (kg): {weight_kg or 'unknown'}",
+            f"Tavily search status: {search_result.get('status')}",
+            f"Tavily has usable results: {usable}",
+            f"Tavily query: {search_result.get('query', '')}",
+            f"Tavily answer: {search_result.get('answer') or 'None'}",
+            f"Tavily source links:\n{format_tavily_source_links(search_result)}",
+            f"Tavily results: {json.dumps(search_result.get('results', []), default=str)[:5000]}",
+            f"Search error (if any): {search_result.get('error') or 'None'}",
+            "If Tavily has usable results=false, prefer met_estimate over use_search.",
+        )
+        started = time.perf_counter()
+        try:
+            parsed = self._llm.generate_structured(
+                purpose="resolve_exercise_calories",
+                system_prompt=_system_prompt(EXERCISE_RESOLVE_SYSTEM_PROMPT, user_profile_context),
+                user_prompt=prompt,
+                response_model=ExerciseCaloriesResponse,
+                temperature=0.1,
+            )
+            if parsed is None:
+                record_llm_call(
+                    purpose="resolve_exercise_calories",
+                    model=self._model,
+                    status="empty",
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    prompt={"user_text": user_text, "payload": payload, "search_result": search_result},
+                )
+                merged = dict(payload)
+                merged["calories_kcal"] = estimate_exercise_calories_kcal(merged, weight_kg=weight_kg)
+                merged["exercise_resolution"] = "met_estimate"
+                return enrich_exercise_log_payload(merged, weight_kg=weight_kg)
+            merged = dict(payload)
+            merged.update(
+                {
+                    "calories_kcal": parsed.calories_kcal,
+                    "exercise_resolution": parsed.resolution,
+                    "exercise_source": parsed.exercise_source,
+                    "exercise_source_url": parsed.source_url,
+                    "exercise_source_urls": parsed.source_urls,
+                    "exercise_confidence": parsed.confidence,
+                    "exercise_sanity_check": parsed.sanity_check,
+                    "exercise_reply": parsed.exercise_reply,
+                    "exercise_notes": parsed.notes,
+                }
+            )
+            record_llm_call(
+                purpose="resolve_exercise_calories",
+                model=self._model,
+                status="success",
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                prompt={"user_text": user_text, "payload": payload, "search_result": search_result},
+                response=parsed.model_dump(),
+            )
+            return enrich_exercise_log_payload(merged, weight_kg=weight_kg)
+        except Exception as exc:
+            record_llm_call(
+                purpose="resolve_exercise_calories",
+                model=self._model,
+                status="error",
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                prompt={"user_text": user_text, "payload": payload, "search_result": search_result},
+                error=str(exc),
+            )
+            logger.exception("Exercise calorie resolve error: %s", exc)
+            merged = dict(payload)
+            merged["calories_kcal"] = estimate_exercise_calories_kcal(merged, weight_kg=weight_kg)
+            merged["exercise_resolution"] = "met_estimate"
+            return enrich_exercise_log_payload(merged, weight_kg=weight_kg)
 
     def answer_research_question(
         self,

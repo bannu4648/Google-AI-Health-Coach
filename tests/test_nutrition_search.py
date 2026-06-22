@@ -1,8 +1,10 @@
 from backend.health_coach.integrations.nutrition import (
     _prefer_food_relevant_results,
+    apply_user_stated_macros,
     build_nutrition_query,
     build_nutrition_user_reply,
     compose_nutrition_reply,
+    extract_user_stated_macros,
     format_tavily_source_links,
     needs_nutrition_lookup,
     search_food_nutrition,
@@ -132,7 +134,11 @@ def test_prefer_food_relevant_results_filters_mixed_pages():
 def test_should_skip_health_sync_for_query_and_followup():
     assert should_skip_health_sync("QUERY_NUTRITION", {"nutrition_resolution": "use_search"})
     assert should_skip_health_sync("LOG_NUTRITION", {"nutrition_resolution": "ask_followup"})
-    assert not should_skip_health_sync("LOG_NUTRITION", {"nutrition_resolution": "use_search"})
+    assert should_skip_health_sync("LOG_NUTRITION", {"nutrition_resolution": "use_search"})
+    assert not should_skip_health_sync(
+        "LOG_NUTRITION",
+        {"nutrition_resolution": "use_search", "calories_kcal": 650},
+    )
 
 
 def test_format_tavily_source_links():
@@ -176,6 +182,46 @@ def test_build_nutrition_user_reply_educated_guess():
     assert "500" in reply
 
 
+def test_build_nutrition_user_reply_missing_calories_lookup_only():
+    reply = build_nutrition_user_reply(
+        {
+            "nutrition_resolution": "educated_guess",
+            "nutrition_lookup_only": True,
+        }
+    )
+    assert "log it" in reply.lower()
+    assert "Logged" not in reply
+    assert "None" not in reply
+
+
+def test_should_skip_health_sync_without_calories():
+    assert should_skip_health_sync(
+        "LOG_NUTRITION",
+        {"nutrition_resolution": "educated_guess", "calories_kcal": None},
+    )
+
+
+def test_nutrition_macros_response_accepts_null_source_url():
+    from backend.health_coach.agent.engine import NutritionMacrosResponse
+
+    parsed = NutritionMacrosResponse.model_validate(
+        {
+            "resolution": "educated_guess",
+            "calories_kcal": 890,
+            "protein_grams": 33,
+            "carbs_grams": 70,
+            "fat_grams": 45,
+            "food_display_name": "Lamb curry meal",
+            "nutrition_source": "",
+            "source_url": None,
+            "source_urls": [],
+            "nutrition_reply": "Logged ~890 kcal estimate.",
+        }
+    )
+    assert parsed.source_url == ""
+    assert parsed.calories_kcal == 890
+
+
 def test_build_nutrition_user_reply_lookup_only_includes_url():
     reply = build_nutrition_user_reply(
         {
@@ -202,3 +248,75 @@ def test_compose_nutrition_reply_prefers_llm_message():
     )
     assert reply.startswith("Got it")
     assert "https://nutritionix.com/food/1" in reply
+
+
+def test_extract_user_stated_macros_from_message():
+    stated = extract_user_stated_macros(
+        "having a coco cream dream protein shake that has a 48g protein w 650 calories now",
+        "",
+    )
+    assert stated["calories_kcal"] == 650
+    assert stated["protein_grams"] == 48
+
+
+def test_extract_user_stated_macros_from_portion_description():
+    stated = extract_user_stated_macros("", "48g protein, 650 calories")
+    assert stated["calories_kcal"] == 650
+    assert stated["protein_grams"] == 48
+
+
+def test_apply_user_stated_macros_overrides_ask_followup():
+    resolved = apply_user_stated_macros(
+        {
+            "food_display_name": "Coco Cream Dream Protein Shake",
+            "portion_description": "48g protein, 650 calories",
+            "nutrition_resolution": "ask_followup",
+            "nutrition_reply": "Could you clarify the scoop count?",
+        },
+        user_text="having a shake with 48g protein and 650 calories",
+    )
+    assert resolved["nutrition_resolution"] == "user_stated"
+    assert resolved["calories_kcal"] == 650
+    assert resolved["protein_grams"] == 48
+    assert should_skip_health_sync("LOG_NUTRITION", resolved) is False
+
+
+def test_apply_user_stated_macros_skips_meal_total_in_batch_item_context():
+    resolved = apply_user_stated_macros(
+        {
+            "food_display_name": "satay beef noodle soup",
+            "nutrition_resolution": "use_search",
+            "calories_kcal": 350,
+        },
+        user_text="it should be around 700 calories for the whole breakfast, search individually",
+        item_context=True,
+    )
+    assert resolved["calories_kcal"] == 350
+    assert resolved["nutrition_resolution"] == "use_search"
+
+
+def test_compose_nutrition_reply_drops_false_log_preamble_on_followup():
+    reply = compose_nutrition_reply(
+        base_reply="Got it! I'm logging your shake to your health app.",
+        resolved={
+            "nutrition_resolution": "ask_followup",
+            "nutrition_reply": "How many scoops did you use?",
+        },
+    )
+    assert "logging your shake" not in reply
+    assert "How many scoops" in reply
+
+
+def test_build_nutrition_user_reply_user_stated():
+    reply = build_nutrition_user_reply(
+        {
+            "nutrition_resolution": "user_stated",
+            "calories_kcal": 650,
+            "protein_grams": 48,
+            "carbs_grams": 47,
+            "fat_grams": 30,
+        }
+    )
+    assert "650" in reply
+    assert "48g protein" in reply
+    assert "numbers you provided" in reply

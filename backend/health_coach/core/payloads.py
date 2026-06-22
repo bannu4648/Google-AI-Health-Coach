@@ -40,6 +40,26 @@ _MEAL_TYPE_ALIASES: dict[str, str] = {
 }
 
 BATCH_NUTRITION_MAX_ITEMS = 8
+BATCH_EXERCISE_MAX_ITEMS = 8
+
+DEFAULT_BODY_WEIGHT_KG = 70.0
+
+# Approximate MET values for calorie estimation (kcal = MET * kg * hours).
+_EXERCISE_MET: dict[str, float] = {
+    "STRENGTH_TRAINING": 5.0,
+    "HIIT": 8.0,
+    "CARDIO_WORKOUT": 7.0,
+    "RUNNING": 9.8,
+    "WALKING": 3.5,
+    "BIKING": 7.5,
+    "YOGA": 3.0,
+    "PILATES": 3.0,
+    "SWIMMING": 8.0,
+    "TENNIS": 7.0,
+    "PICKLEBALL": 6.0,
+    "EXERCISE_CLASS": 5.5,
+    "EXERCISE_TYPE_UNSPECIFIED": 4.0,
+}
 
 
 def normalize_meal_type(raw: str | None) -> str:
@@ -74,6 +94,60 @@ def expand_nutrition_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
     if payload.get("food_display_name"):
         return [dict(payload)]
     return []
+
+
+def expand_exercise_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expand single-item or batch LOG_EXERCISE payloads into per-item dicts."""
+    items = payload.get("items")
+    if isinstance(items, list) and items:
+        expanded: list[dict[str, Any]] = []
+        for item in items[:BATCH_EXERCISE_MAX_ITEMS]:
+            if not isinstance(item, dict):
+                continue
+            merged = dict(payload)
+            merged.pop("items", None)
+            merged.update(item)
+            if merged.get("display_name") or merged.get("exercise_type"):
+                expanded.append(merged)
+        if expanded:
+            return expanded
+    if payload.get("display_name") or payload.get("exercise_type"):
+        return [dict(payload)]
+    return [dict(payload)] if payload else []
+
+
+def fix_exercise_data_point_structure(
+    data_point: dict[str, Any],
+    error_message: str,
+) -> dict[str, Any] | None:
+    """Repair exercise DataPoint JSON after API validation errors (e.g. activeEnergy)."""
+    lowered = (error_message or "").lower()
+    exercise = dict(data_point.get("exercise") or {})
+    if not exercise:
+        return None
+    metrics = dict(exercise.get("metricsSummary") or {})
+    changed = False
+
+    if "activeenergy" in lowered or (
+        "metrics_summary" in lowered and "unknown name" in lowered
+    ):
+        if "activeEnergy" in metrics:
+            kcal = metrics.get("activeEnergy", {}).get("kcal")
+            metrics.pop("activeEnergy", None)
+            if kcal:
+                metrics["caloriesKcal"] = int(kcal)
+            changed = True
+        if not metrics:
+            exercise.pop("metricsSummary", None)
+            changed = True
+
+    if not changed:
+        return None
+    if metrics:
+        exercise["metricsSummary"] = metrics
+    else:
+        exercise.pop("metricsSummary", None)
+    return {"exercise": exercise}
 
 
 def _utc_now() -> str:
@@ -242,23 +316,76 @@ def _duration_seconds(payload: dict[str, Any], *, default_minutes: int = 30) -> 
     return f"{seconds}s"
 
 
-def build_exercise_data_point(payload: dict[str, Any]) -> dict[str, Any]:
+def parse_active_duration_minutes(active_duration: str | None) -> int | None:
+    """Parse Google Health activeDuration strings like '1500s' or '1920.508s'."""
+    if not active_duration:
+        return None
+    text = str(active_duration).strip().rstrip("s")
+    try:
+        return max(1, int(round(float(text) / 60.0)))
+    except (TypeError, ValueError):
+        return None
+
+
+def exercise_met_value(exercise_type: str | None) -> float:
+    normalized = normalize_exercise_type(exercise_type)
+    return _EXERCISE_MET.get(normalized, 5.0)
+
+
+def estimate_exercise_calories_kcal(
+    payload: dict[str, Any],
+    *,
+    weight_kg: float | None = None,
+) -> int:
+    """Estimate active calories from duration, exercise type, and body weight."""
+    existing = _safe_int(payload.get("calories_kcal"), 0)
+    if existing > 0:
+        return existing
+    minutes = payload.get("duration_minutes")
+    if minutes is None:
+        minutes = parse_active_duration_minutes(payload.get("active_duration"))
+    if minutes is None:
+        return 0
+    body_kg = float(weight_kg if weight_kg is not None else DEFAULT_BODY_WEIGHT_KG)
+    met = exercise_met_value(payload.get("exercise_type"))
+    hours = max(1.0 / 60.0, float(minutes) / 60.0)
+    return max(1, int(round(met * body_kg * hours)))
+
+
+def enrich_exercise_log_payload(
+    payload: dict[str, Any],
+    *,
+    weight_kg: float | None = None,
+) -> dict[str, Any]:
+    """Fill calories_kcal on router payloads when the model omitted an estimate."""
+    enriched = dict(payload)
+    if _safe_int(enriched.get("calories_kcal"), 0) <= 0:
+        estimated = estimate_exercise_calories_kcal(enriched, weight_kg=weight_kg)
+        if estimated > 0:
+            enriched["calories_kcal"] = estimated
+    return enriched
+
+
+def build_exercise_data_point(
+    payload: dict[str, Any],
+    *,
+    weight_kg: float | None = None,
+) -> dict[str, Any]:
+    payload = enrich_exercise_log_payload(payload, weight_kg=weight_kg)
     calories = _safe_int(payload.get("calories_kcal"), 0)
-    metrics: dict[str, Any] = {}
-    if calories > 0:
-        metrics["activeEnergy"] = {"kcal": calories}
-    return {
-        "exercise": {
-            "interval": _session_interval(payload, default_duration_minutes=int(
-                payload.get("duration_minutes") or 30
-            )),
-            "exerciseType": normalize_exercise_type(payload.get("exercise_type")),
-            "displayName": payload.get("display_name") or payload.get("food_display_name") or "Workout",
-            "activeDuration": _duration_seconds(payload),
-            "notes": payload.get("notes") or "",
-            "metricsSummary": metrics or {"activeEnergy": {"kcal": 0}},
-        }
+    exercise: dict[str, Any] = {
+        "interval": _session_interval(
+            payload,
+            default_duration_minutes=int(payload.get("duration_minutes") or 30),
+        ),
+        "exerciseType": normalize_exercise_type(payload.get("exercise_type")),
+        "displayName": payload.get("display_name") or payload.get("food_display_name") or "Workout",
+        "activeDuration": _duration_seconds(payload),
+        "notes": payload.get("notes") or "",
     }
+    if calories > 0:
+        exercise["metricsSummary"] = {"caloriesKcal": calories}
+    return {"exercise": exercise}
 
 
 def build_weight_data_point(payload: dict[str, Any]) -> dict[str, Any]:
@@ -269,6 +396,16 @@ def build_weight_data_point(payload: dict[str, Any]) -> dict[str, Any]:
             "notes": payload.get("notes"),
         }
     }
+
+
+_INTENT_DATA_TYPES = {
+    "LOG_NUTRITION": "nutrition-log",
+    "UPDATE_NUTRITION": "nutrition-log",
+    "LOG_HYDRATION": "hydration-log",
+    "LOG_WEIGHT": "weight",
+    "LOG_EXERCISE": "exercise",
+    "UPDATE_EXERCISE": "exercise",
+}
 
 
 def normalize_router_payload(intent: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -288,7 +425,10 @@ def normalize_router_payload(intent: str, payload: dict[str, Any]) -> dict[str, 
                 data_point["hydrationLog"].get("interval", {}),
                 duration_minutes=1,
             )
-        return payload
+        return {
+            "data_type": payload.get("data_type") or _INTENT_DATA_TYPES.get(intent, ""),
+            "data_point": data_point,
+        }
 
     if intent == "LOG_NUTRITION":
         return {

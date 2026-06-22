@@ -325,6 +325,18 @@ def init_db() -> None:
             );
 
             CREATE INDEX IF NOT EXISTS idx_undoable_created ON undoable_health_logs(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS weight_logs (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                logged_at_hkt TEXT NOT NULL,
+                weight_kg REAL NOT NULL,
+                source TEXT,
+                google_health_resource TEXT,
+                notes TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_weight_logged ON weight_logs(logged_at_hkt DESC);
             """
         )
         _ensure_coach_views(conn)
@@ -728,6 +740,45 @@ def delete_undoable_log(log_id: str) -> None:
     init_db()
     with connect() as conn:
         conn.execute("DELETE FROM undoable_health_logs WHERE id = ?", (log_id,))
+
+
+def record_weight_log(
+    *,
+    weight_kg: float,
+    logged_at_hkt: str,
+    source: str | None = None,
+    google_health_resource: str | None = None,
+    notes: str | None = None,
+) -> str:
+    return _insert(
+        "weight_logs",
+        {
+            "logged_at_hkt": logged_at_hkt,
+            "weight_kg": round(float(weight_kg), 2),
+            "source": source,
+            "google_health_resource": google_health_resource,
+            "notes": notes,
+        },
+    )
+
+
+def fetch_latest_weight_log() -> dict[str, Any] | None:
+    init_db()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM weight_logs ORDER BY logged_at_hkt DESC LIMIT 1"
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def fetch_recent_weight_logs(*, limit: int = 12) -> list[dict[str, Any]]:
+    init_db()
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM weight_logs ORDER BY logged_at_hkt DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 init_db()

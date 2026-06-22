@@ -25,7 +25,18 @@ COACHING_INTENTS = frozenset(
         "QUERY_GOALS",
         "CREATE_FITNESS_PLAN",
         "QUERY_FITNESS_PLAN",
+        "LOG_NUTRITION",
+        "QUERY_NUTRITION",
+        "UPDATE_NUTRITION",
     }
+)
+
+_SCHEDULED_PREFIXES = (
+    "Workout reminder:",
+    "Mid-day check-in:",
+    "Morning briefing",
+    "Evening recap",
+    "Week in review:",
 )
 
 
@@ -75,7 +86,7 @@ def format_history_for_prompt(
             ):
                 skipped_current = True
                 continue
-            label = "User" if row["direction"] == "inbound" else "Coach"
+            label = _message_label(row)
             lines.append(f"{label}: {_truncate_history_text(text)}")
         if len(lines) > 1:
             return "\n".join(lines)
@@ -85,16 +96,39 @@ def format_history_for_prompt(
         return ""
     lines = ["Recent conversation (oldest first):"]
     for turn in turns:
-        label = "User" if turn.role == "user" else "Coach"
+        if turn.role == "coach" and any(turn.text.startswith(prefix) for prefix in _SCHEDULED_PREFIXES):
+            label = "Coach (scheduled)"
+        else:
+            label = "User" if turn.role == "user" else "Coach"
         lines.append(f"{label}: {_truncate_history_text(turn.text)}")
     return "\n".join(lines)
+
+
+def _message_label(row: dict) -> str:
+    text = (row.get("text") or "").strip()
+    if row["direction"] == "inbound":
+        return "User"
+    if any(text.startswith(prefix) for prefix in _SCHEDULED_PREFIXES):
+        return "Coach (scheduled)"
+    payload = row.get("payload") or {}
+    if isinstance(payload, dict) and payload.get("source") == "scheduler":
+        return "Coach (scheduled)"
+    return "Coach"
+
+
+def record_coach_outreach(sender_phone: str, *, text: str, source: str = "scheduler") -> None:
+    """Record proactive coach messages so follow-ups have full thread context."""
+    if not sender_phone or not text.strip():
+        return
+    prefix = f"[{source}] " if source != "scheduler" else ""
+    append_turn(sender_phone, role="coach", text=f"{prefix}{text.strip()}")
 
 
 def append_turn(sender_phone: str, *, role: str, text: str) -> None:
     if not sender_phone or not text.strip():
         return
     with _lock:
-        history = _histories.setdefault(sender_phone, deque(maxlen=MAX_TURNS * 2))
+        history = _histories.setdefault(sender_phone, deque(maxlen=COACHING_MAX_TURNS * 2))
         history.append(Turn(role=role, text=text.strip()))
 
 

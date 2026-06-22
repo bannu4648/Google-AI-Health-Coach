@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..integrations.google_health import GoogleHealthClient
+from .nutrition_plan import sum_today_nutrition
 from .user_goals import fetch_active_goals, format_goals_for_reply
 
 
@@ -12,6 +13,34 @@ def _goal_progress_line(goal: dict[str, Any], snapshot: dict[str, Any]) -> str:
     target = goal.get("target") or {}
     category = (goal.get("category") or "").lower()
     text = goal.get("goal_text", "")
+
+    if category == "nutrition" and (
+        target.get("protein_grams_min") or target.get("daily_calories_target")
+    ):
+        intake = sum_today_nutrition(snapshot)
+        p_min = int(target.get("protein_grams_min", 115) or 115)
+        p_max = int(target.get("protein_grams_max", p_min) or p_min)
+        kcal_target = int(target.get("daily_calories_target", 1900) or 1900)
+        return (
+            f"{text}: {intake['protein_grams']}/{p_min}–{p_max} g protein, "
+            f"{intake['calories_kcal']}/{kcal_target} kcal today "
+            f"({intake['meals_logged']} meals)"
+        )
+
+    if category == "weight" and target.get("target_weight_kg"):
+        from .user_profile import fetch_user_profile_snapshot
+
+        current = fetch_user_profile_snapshot().get("weight_kg")
+        start = target.get("start_weight_kg") or current
+        target_kg = float(target["target_weight_kg"])
+        if current is not None and start is not None:
+            lost = float(start) - float(current)
+            to_go = float(current) - target_kg
+            return (
+                f"{text}: {current} kg now "
+                f"({lost:.1f} kg lost, {max(0, to_go):.1f} kg to go)"
+            )
+        return text
 
     if category == "fitness" or target.get("sessions_per_week"):
         sessions_target = int(target.get("sessions_per_week", 0) or 0)

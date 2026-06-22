@@ -7,9 +7,10 @@ from __future__ import annotations
 from typing import Any
 
 from ..integrations.google_health import GoogleHealthClient
-from .coach_state import format_coach_state_for_prompt
+from .coach_state import build_coach_state_snapshot, format_coach_state_for_prompt
 from .coaching_preferences import format_coaching_focus_for_prompt
 from .goal_progress import format_goal_progress_for_prompt
+from .nutrition_plan import format_nutrition_plan_for_prompt
 from .memory import format_history_for_prompt
 from .user_profile import fetch_user_profile_snapshot, format_user_profile_for_prompt
 
@@ -20,6 +21,7 @@ def build_llm_context(
     user_text: str = "",
     health_client: GoogleHealthClient | None = None,
     intent: str = "",
+    include_health_snapshot: bool = True,
 ) -> dict[str, str]:
     """Conversation + profile + coach memory blocks for all coach LLM calls."""
     conversation_context = format_history_for_prompt(
@@ -29,12 +31,33 @@ def build_llm_context(
     )
     snapshot = fetch_user_profile_snapshot(client=health_client)
     user_profile_context = format_user_profile_for_prompt(snapshot)
-    coach_state_context = format_coach_state_for_prompt(client=health_client)
-    goal_progress_context = format_goal_progress_for_prompt(client=health_client)
+
+    coach_state_context = ""
+    goal_progress_context = ""
+    nutrition_plan_context = ""
+    health_snapshot = None
+    if include_health_snapshot:
+        from .coaching import get_daily_health_snapshot
+
+        health_snapshot = get_daily_health_snapshot(client=health_client)
+        coach_state_context = format_coach_state_for_prompt(
+            build_coach_state_snapshot(client=health_client, health_snapshot=health_snapshot),
+        )
+        goal_progress_context = format_goal_progress_for_prompt(
+            snapshot=health_snapshot,
+            client=health_client,
+        )
+    nutrition_plan_context = format_nutrition_plan_for_prompt(snapshot=health_snapshot)
+
     coaching_focus_context = format_coaching_focus_for_prompt()
     merged_coach = "\n\n".join(
         part
-        for part in (coach_state_context, goal_progress_context, coaching_focus_context)
+        for part in (
+            coach_state_context,
+            nutrition_plan_context,
+            goal_progress_context,
+            coaching_focus_context,
+        )
         if part.strip()
     )
     return {

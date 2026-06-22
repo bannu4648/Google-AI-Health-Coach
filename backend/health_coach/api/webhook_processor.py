@@ -8,7 +8,6 @@ from typing import Any
 from ..agent.graph import run_coach
 from ..core.database import (
     get_whatsapp_reply,
-    record_message,
     record_whatsapp_reply,
 )
 from ..integrations.google_auth import GoogleAuthRequiredError, whatsapp_reauth_message
@@ -79,14 +78,6 @@ def process_incoming_message(
                 send_status=status,
                 phone=sender,
             )
-        record_message(
-            "outbound",
-            phone=sender,
-            text=final_reply,
-            status=status,
-            payload={"intent": result.get("intent"), "send_result": send_result},
-            message_id=f"reply-{message_id}" if message_id else None,
-        )
     except GoogleAuthRequiredError as exc:
         logger.warning("Google Health auth required: %s", exc)
         fallback = whatsapp_reauth_message(phone=sender)
