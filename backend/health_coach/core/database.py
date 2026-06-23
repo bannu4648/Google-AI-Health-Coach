@@ -285,7 +285,8 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
                 phone TEXT,
-                used_at TEXT
+                used_at TEXT,
+                code_verifier TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_goals_status ON user_goals(status, created_at DESC);
@@ -340,6 +341,16 @@ def init_db() -> None:
             """
         )
         _ensure_coach_views(conn)
+        _ensure_oauth_pending_columns(conn)
+
+
+def _ensure_oauth_pending_columns(conn: sqlite3.Connection) -> None:
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(oauth_pending_states)").fetchall()
+    }
+    if "code_verifier" not in columns:
+        conn.execute("ALTER TABLE oauth_pending_states ADD COLUMN code_verifier TEXT")
 
 
 def _ensure_coach_views(conn: sqlite3.Connection) -> None:
@@ -704,6 +715,15 @@ def mark_oauth_pending_state_used(state: str) -> None:
         conn.execute(
             "UPDATE oauth_pending_states SET used_at = ? WHERE state = ?",
             (utc_now_iso(), state),
+        )
+
+
+def save_oauth_code_verifier(state: str, code_verifier: str) -> None:
+    init_db()
+    with connect() as conn:
+        conn.execute(
+            "UPDATE oauth_pending_states SET code_verifier = ? WHERE state = ?",
+            (code_verifier, state),
         )
 
 

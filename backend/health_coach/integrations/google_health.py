@@ -104,6 +104,9 @@ class GoogleHealthClient:
                 TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
             except RefreshError as exc:
                 self._credentials = None
+                from .google_auth import notify_google_auth_required
+
+                notify_google_auth_required()
                 raise GoogleAuthRequiredError(
                     f"Google Health token refresh failed: {exc}"
                 ) from exc

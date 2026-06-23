@@ -13,8 +13,10 @@ import json
 import logging
 import os
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Lock
 
 from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
@@ -25,6 +27,7 @@ from ..core.database import (
     create_oauth_pending_state,
     get_oauth_pending_state,
     mark_oauth_pending_state_used,
+    save_oauth_code_verifier,
     utc_now_iso,
 )
 
@@ -48,6 +51,10 @@ HEALTH_SCOPES = [
 
 REAUTH_COMMAND = "python3 -m backend.health_coach.integrations.google_auth"
 OAUTH_STATE_TTL_MINUTES = 15
+AUTH_NOTIFY_COOLDOWN_SECONDS = int(os.getenv("GOOGLE_AUTH_NOTIFY_COOLDOWN_SECONDS", "3600"))
+
+_auth_notify_lock = Lock()
+_last_auth_notify_at: dict[str, float] = {}
 
 
 class GoogleAuthRequiredError(Exception):
@@ -164,6 +171,8 @@ def build_google_authorization_url(*, state: str) -> str:
         include_granted_scopes="true",
         prompt="consent",
     )
+    if flow.code_verifier:
+        save_oauth_code_verifier(state, flow.code_verifier)
     return auth_url
 
 
@@ -176,7 +185,13 @@ def complete_mobile_auth(*, state: str, code: str) -> Credentials:
         raise GoogleAuthRequiredError("Invalid or used OAuth state.")
     if pending["expires_at"] < utc_now_iso():
         raise GoogleAuthRequiredError("OAuth link expired.")
+    code_verifier = pending.get("code_verifier")
+    if not code_verifier:
+        raise GoogleAuthRequiredError(
+            "OAuth session expired before callback. Open a fresh sign-in link and try again."
+        )
     flow = _build_web_flow(redirect_uri=redirect_uri, state=state)
+    flow.code_verifier = code_verifier
     flow.fetch_token(code=code)
     creds = flow.credentials
     if not creds or not creds.valid:
@@ -185,6 +200,43 @@ def complete_mobile_auth(*, state: str, code: str) -> Credentials:
     mark_oauth_pending_state_used(state)
     logger.info("Mobile OAuth complete; token.json updated.")
     return creds
+
+
+def notify_google_auth_required(phone: str | None = None) -> bool:
+    """
+    Send a WhatsApp OAuth renewal link when Google Health auth fails.
+
+    Rate-limited per phone (default: once per hour) to avoid spam during outages.
+    Returns True if a message was sent.
+    """
+    recipient = (phone or os.getenv("SUMMARY_RECIPIENT_PHONE") or "").strip()
+    if not recipient:
+        logger.warning("Google auth required but no recipient phone configured.")
+        return False
+    if not public_base_url():
+        logger.warning("Google auth required but PUBLIC_BASE_URL is not set.")
+        return False
+
+    now = time.time()
+    with _auth_notify_lock:
+        last = _last_auth_notify_at.get(recipient, 0.0)
+        if now - last < AUTH_NOTIFY_COOLDOWN_SECONDS:
+            return False
+        _last_auth_notify_at[recipient] = now
+
+    try:
+        from .whatsapp import send_text_message
+
+        message = whatsapp_reauth_message(phone=recipient)
+        result = send_text_message(recipient, message)
+        if result.get("error"):
+            logger.warning("Failed to send Google auth renewal WhatsApp: %s", result)
+            return False
+        logger.info("Sent Google auth renewal link to %s", recipient)
+        return True
+    except Exception as exc:
+        logger.warning("Could not send Google auth renewal WhatsApp: %s", exc)
+        return False
 
 
 def whatsapp_reauth_message(*, phone: str | None = None) -> str:
@@ -238,6 +290,51 @@ def load_credentials(
     )
 
 
+def _authorize_via_public_url(
+    token_path: Path = TOKEN_FILE,
+    *,
+    phone: str | None = None,
+    timeout_seconds: int = 600,
+) -> Credentials:
+    """
+    Sign in through PUBLIC_BASE_URL (ngrok) — matches the web OAuth client in credentials.json.
+
+    Avoids localhost:8080 redirect_uri_mismatch when the desktop client only lists http://localhost.
+    """
+    import time
+    import webbrowser
+
+    link = create_mobile_auth_link(phone=phone)
+    if not link:
+        raise GoogleAuthRequiredError(
+            "PUBLIC_BASE_URL is not set. Add your ngrok HTTPS URL to .env, or register "
+            "http://localhost:8080/ in Google Cloud Console for the desktop OAuth client."
+        )
+
+    mtime_before = token_path.stat().st_mtime if token_path.exists() else 0
+    print(
+        "\nGoogle sign-in (use your registered ngrok callback):\n"
+        f"{link}\n\n"
+        "If ngrok shows a warning page, tap **Visit Site** first.\n"
+        "Waiting for you to complete sign-in in the browser…\n"
+    )
+    webbrowser.open(link)
+
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        time.sleep(2)
+        try:
+            creds = load_credentials(token_path=token_path)
+            logger.info("Authorization complete via PUBLIC_BASE_URL.")
+            return creds
+        except GoogleAuthRequiredError:
+            if token_path.exists() and token_path.stat().st_mtime > mtime_before:
+                continue
+    raise GoogleAuthRequiredError(
+        "Timed out waiting for sign-in. Open the link again (Safari/Chrome works best)."
+    )
+
+
 def authorize(
     *,
     credentials_path: Path = CREDENTIALS_FILE,
@@ -269,6 +366,9 @@ def authorize(
                 return refreshed
             logger.info("Refresh token revoked — opening browser for new consent.")
 
+    if public_base_url():
+        return _authorize_via_public_url(token_path=token_path)
+
     installed = _installed_client_config(credentials_path)
     if installed:
         flow = InstalledAppFlow.from_client_config(installed, scopes=HEALTH_SCOPES)
@@ -281,5 +381,8 @@ def authorize(
 
 
 if __name__ == "__main__":
+    from dotenv import load_dotenv
+
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    load_dotenv(PROJECT_ROOT / ".env")
     authorize()

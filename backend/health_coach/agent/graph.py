@@ -14,6 +14,7 @@ from langgraph.types import Command, Send, interrupt
 
 from ..core.health_normalizer import normalize_health_result
 from ..core.payloads import expand_nutrition_items
+from ..integrations.google_auth import GoogleAuthRequiredError
 from ..integrations.google_health import GoogleHealthClient
 from ..integrations.exercise import compose_exercise_reply
 from ..integrations.nutrition import (
@@ -182,6 +183,37 @@ def _apply_plan_context_guard(
     if wellness_score >= 2 and wellness_score >= fitness_score:
         return Intent.BUILD_WELLNESS_PLAN.value
     return intent
+
+
+def _is_day_review_request(user_text: str) -> bool:
+    lowered = user_text.lower()
+    time_refs = ("yesterday", "yday", "last night", "previous day", "today", "this morning")
+    data_refs = ("food", "meal", "meals", "ate", "exercise", "exercises", "workout", "workouts", "logged")
+    review_refs = (
+        "healthy",
+        "goal",
+        "goals",
+        "towards",
+        "on track",
+        "how did",
+        "assessment",
+        "good day",
+        "tell me if",
+        "was it",
+    )
+    has_time = any(token in lowered for token in time_refs)
+    has_food = any(token in lowered for token in ("food", "meal", "meals", "ate", "nutrition"))
+    has_exercise = any(token in lowered for token in ("exercise", "exercises", "workout", "workouts", "gym"))
+    has_review = any(token in lowered for token in review_refs)
+    return has_time and has_food and has_exercise and has_review
+
+
+def _apply_day_review_guard(user_text: str, intent: str) -> tuple[str, dict]:
+    if not _is_day_review_request(user_text):
+        return intent, {}
+    lowered = user_text.lower()
+    day_offset = 0 if any(token in lowered for token in ("today", "this morning", "so far")) else -1
+    return Intent.EVALUATE_DAY.value, {"day_offset_days": day_offset}
 
 
 def _apply_workout_followup_guard(
@@ -537,6 +569,15 @@ def build_coach_graph(
         intent = _apply_workout_followup_guard(user_text, intent, ctx["conversation_context"])
         intent = _apply_nutrition_retry_guard(user_text, intent)
         intent = _apply_wellness_plan_phrasing(user_text, intent)
+        day_intent, day_payload = _apply_day_review_guard(user_text, intent)
+        if day_intent == Intent.EVALUATE_DAY.value:
+            return {
+                **_turn_reset_state(),
+                "intent": day_intent,
+                "payload": day_payload,
+                "conversational_reply": "",
+                "api_result": None,
+            }
         return {
             "intent": intent,
             "payload": payload,
@@ -893,6 +934,30 @@ def build_coach_graph(
             "final_reply": generated.final_reply,
         }
 
+    def evaluate_day(state: CoachState) -> CoachState:
+        from ..services.coaching import evaluate_day_towards_goals
+
+        payload = state.get("payload", {}) or {}
+        day_offset = int(payload.get("day_offset_days", -1))
+        try:
+            result = evaluate_day_towards_goals(
+                day_offset=day_offset,
+                user_text=state.get("user_text", ""),
+                client=client,
+            )
+            return {"api_result": result, "final_reply": result.get("message", "")}
+        except GoogleAuthRequiredError:
+            raise
+        except Exception as exc:
+            logger.exception("Day review failed: %s", exc)
+            return {
+                "final_reply": (
+                    "I couldn't pull your Google Health logs for that day just now. "
+                    "Please try again in a moment."
+                ),
+                "api_result": {"error": True, "message": str(exc)},
+            }
+
     def finalize_reply(state: CoachState) -> CoachState:
         if state.get("final_reply"):
             return {}
@@ -1082,6 +1147,7 @@ def build_coach_graph(
     workflow.add_node("execute_health", execute_health)
     workflow.add_node("query_coach_data", query_coach_data)
     workflow.add_node("build_wellness_plan", build_wellness_plan)
+    workflow.add_node("evaluate_day", evaluate_day)
     workflow.add_node("finalize_reply", finalize_reply)
 
     workflow.set_conditional_entry_point(
@@ -1108,6 +1174,7 @@ def build_coach_graph(
             "execute_health": "execute_health",
             "query_coach_data": "query_coach_data",
             "build_wellness_plan": "build_wellness_plan",
+            "evaluate_day": "evaluate_day",
             "finalize_reply": "finalize_reply",
         },
     )
@@ -1122,6 +1189,7 @@ def build_coach_graph(
             "execute_health": "execute_health",
             "query_coach_data": "query_coach_data",
             "build_wellness_plan": "build_wellness_plan",
+            "evaluate_day": "evaluate_day",
             "finalize_reply": "finalize_reply",
             "process_batch_item": "process_batch_item",
         },
@@ -1144,6 +1212,7 @@ def build_coach_graph(
     workflow.add_edge("research_answer", END)
     workflow.add_edge("query_coach_data", END)
     workflow.add_edge("build_wellness_plan", END)
+    workflow.add_edge("evaluate_day", END)
     workflow.add_edge("execute_health", "finalize_reply")
     workflow.add_edge("finalize_reply", END)
 

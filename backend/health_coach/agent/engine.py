@@ -58,6 +58,7 @@ class Intent(str, Enum):
     QUERY_TRENDS = "QUERY_TRENDS"
     QUERY_SLEEP = "QUERY_SLEEP"
     COACHING_CHAT = "COACHING_CHAT"
+    EVALUATE_DAY = "EVALUATE_DAY"
     UNDO_LAST_LOG = "UNDO_LAST_LOG"
     DELETE_NUTRITION = "DELETE_NUTRITION"
 
@@ -424,6 +425,7 @@ Routing:
 - Medical PDF or document summary -> SUMMARIZE_DOCUMENT
 - Weight/scale -> LOG_WEIGHT
 - Past logs/history -> QUERY_HISTORY
+- Review a specific day (meals + workouts) vs goals -> EVALUATE_DAY with day_offset_days (-1=yesterday, 0=today)
 - Weekly trends/averages -> QUERY_TRENDS
 - Sleep -> QUERY_SLEEP
 - Undo last log -> UNDO_LAST_LOG (payload: optional data_type hint)

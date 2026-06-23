@@ -20,6 +20,7 @@ PipelineName = Literal[
     "document",
     "coach_data",
     "wellness_plan",
+    "day_review",
 ]
 
 GraphNodeName = Literal[
@@ -30,6 +31,7 @@ GraphNodeName = Literal[
     "execute_health",
     "query_coach_data",
     "build_wellness_plan",
+    "evaluate_day",
     "finalize_reply",
 ]
 
@@ -74,6 +76,7 @@ INTENT_CAPABILITIES: dict[str, IntentCapability] = {
     Intent.QUERY_HISTORY.value: IntentCapability("health_query"),
     Intent.QUERY_TRENDS.value: IntentCapability("health_query"),
     Intent.QUERY_SLEEP.value: IntentCapability("health_query"),
+    Intent.EVALUATE_DAY.value: IntentCapability("day_review", terminal=True),
     Intent.COACHING_CHAT.value: IntentCapability("coach_only", terminal=True),
     Intent.UNDO_LAST_LOG.value: IntentCapability("local"),
 }
@@ -104,6 +107,8 @@ def route_after_intent(intent: str, payload: dict) -> GraphNodeName:
         return "query_coach_data"
     if cap.pipeline == "wellness_plan":
         return "build_wellness_plan"
+    if cap.pipeline == "day_review":
+        return "evaluate_day"
     if cap.pipeline in {"document", "coach_only"}:
         return "finalize_reply"
     if cap.pipeline == "local" or cap.pipeline == "health_write":

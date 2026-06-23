@@ -25,7 +25,8 @@ from ..services.fitness_plans import (
     plan_adherence_summary,
 )
 from ..services.user_goals import fetch_active_goals, format_goals_for_reply
-from ..services.goal_progress import format_goal_progress_for_summary
+from ..services.goal_progress import enrich_goals_with_progress, format_goal_progress_for_summary
+from ..services.nutrition_plan import build_nutrition_plan, sum_today_nutrition
 from ..integrations.google_health import GoogleHealthAPIError, GoogleHealthClient
 
 WEEKLY_LOOKBACK_DAYS = 7
@@ -650,6 +651,129 @@ def _coach_adherence_context() -> dict[str, Any]:
     return context
 
 
+def _meal_lines_from_snapshot(snapshot: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    for item in snapshot.get("nutrition", {}).get("items", []):
+        nutrition = item.get("nutritionLog") or item.get("nutrition_log") or {}
+        if not nutrition:
+            continue
+        name = nutrition.get("foodDisplayName") or "Meal"
+        kcal = int((nutrition.get("energy") or {}).get("kcal") or 0)
+        protein = 0.0
+        for nutrient in nutrition.get("nutrients") or []:
+            if nutrient.get("nutrient") == "PROTEIN":
+                protein = float((nutrient.get("quantity") or {}).get("grams") or 0)
+                break
+        meal_type = nutrition.get("mealType") or ""
+        lines.append(f"{name} ({meal_type}): {kcal} kcal, {int(protein)}g protein")
+    return lines
+
+
+def _exercise_lines_from_snapshot(snapshot: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    for record in snapshot.get("exercise", {}).get("sessions") or []:
+        title = record.get("title") or record.get("activity_type") or "Workout"
+        duration = record.get("duration_minutes")
+        kcal = record.get("active_energy_kcal") or record.get("calories_kcal")
+        parts = [title]
+        if duration:
+            parts.append(f"{duration} min")
+        if kcal:
+            parts.append(f"{int(kcal)} kcal")
+        lines.append(" — ".join(parts))
+    if not lines:
+        count = snapshot.get("exercise", {}).get("count", 0)
+        if count:
+            lines.append(f"{count} workout(s) logged (details unavailable)")
+    return lines
+
+
+def _day_offset_from_text(user_text: str, *, default: int = -1) -> int:
+    lowered = user_text.lower()
+    if any(token in lowered for token in ("today", "this morning", "so far")):
+        return 0
+    if any(token in lowered for token in ("yesterday", "yday", "previous day", "last night")):
+        return -1
+    return default
+
+
+def evaluate_day_towards_goals(
+    *,
+    day_offset: int = -1,
+    user_text: str = "",
+    client: GoogleHealthClient | None = None,
+) -> dict[str, Any]:
+    """Fetch a day's meals + workouts and assess progress vs active goals."""
+    health = client or GoogleHealthClient()
+    tz = get_user_tz()
+    if user_text:
+        day_offset = _day_offset_from_text(user_text, default=day_offset)
+    target_day = now_local().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(
+        days=day_offset
+    )
+    snapshot = get_daily_health_snapshot(client=health, day=target_day)
+    date_hkt = snapshot.get("date_hkt") or target_day.strftime("%Y-%m-%d")
+    intake = sum_today_nutrition(snapshot)
+    meals = _meal_lines_from_snapshot(snapshot)
+    exercises = _exercise_lines_from_snapshot(snapshot)
+    goals = enrich_goals_with_progress(snapshot=snapshot, client=health)
+    plan = build_nutrition_plan(goals=goals)
+    goal_progress = format_goal_progress_for_summary(goals, snapshot=snapshot, client=health)
+
+    draft_parts = [f"Day review for {date_hkt} (HKT):"]
+    if meals:
+        draft_parts.append("Meals: " + "; ".join(meals))
+    else:
+        draft_parts.append("Meals: none logged.")
+    if exercises:
+        draft_parts.append("Exercise: " + "; ".join(exercises))
+    else:
+        draft_parts.append("Exercise: none logged.")
+    draft_parts.append(
+        f"Totals: {intake['calories_kcal']} kcal, {intake['protein_grams']}g protein "
+        f"({intake['meals_logged']} meals)."
+    )
+    if goal_progress:
+        draft_parts.append(f"Goal progress: {goal_progress}")
+    draft = " ".join(draft_parts)
+
+    llm_payload = enrich_health_api_result_for_llm(snapshot)
+    llm_payload["nutrition_totals"] = intake
+    llm_payload["meal_lines"] = meals
+    llm_payload["exercise_lines"] = exercises
+    llm_payload["nutrition_plan"] = plan
+    llm_payload["goals"] = goals
+    llm_payload["goal_progress"] = goal_progress
+
+    prompt = (
+        f"Review health logs for {date_hkt} only. List each meal and workout logged that day. "
+        "Compare total calories and protein to the user's active nutrition goals. "
+        "Give a clear verdict: was this day on-track, mixed, or off-track for their goals? "
+        "Be specific with numbers and one practical suggestion for the next day."
+    )
+    if user_text.strip():
+        prompt = f"User asked: {user_text.strip()}\n\n{prompt}"
+
+    try:
+        engine = AIEngine()
+        profile_context = format_user_profile_for_prompt(fetch_user_profile_snapshot(client=health))
+        message = engine.summarize_health_data(
+            user_text=prompt,
+            draft_reply=draft,
+            api_result=llm_payload,
+            user_profile_context=profile_context,
+        )
+    except Exception:
+        message = draft
+
+    return {
+        "date_hkt": date_hkt,
+        "snapshot": snapshot,
+        "nutrition_totals": intake,
+        "message": message,
+    }
+
+
 def build_daily_coach_message(
     summary_type: str,
     snapshot: dict[str, Any],
@@ -666,17 +790,30 @@ def build_daily_coach_message(
         goals_line = f" Active goals: {len(adherence['goals'])}."
 
     if summary_type == "evening":
+        intake = sum_today_nutrition(snapshot)
+        meals = _meal_lines_from_snapshot(snapshot)
+        exercises = _exercise_lines_from_snapshot(snapshot)
+        snapshot["nutrition_totals"] = intake
+        snapshot["meal_lines"] = meals
+        snapshot["exercise_lines"] = exercises
         draft = (
             f"Evening recap for {snapshot['date_hkt']}: "
             f"{snapshot['steps']['count']} steps, {snapshot['exercise']['count']} workouts, "
             f"{snapshot['nutrition']['count']} meals logged today. "
+            f"Nutrition total: {intake['calories_kcal']} kcal, {intake['protein_grams']}g protein. "
             f"Readiness is {snapshot['readiness']['score']}/100 ({snapshot['readiness']['label']})."
             f"{plan_line}{goals_line}"
         )
+        if meals:
+            draft += f" Meals: {'; '.join(meals)}."
+        if exercises:
+            draft += f" Workouts: {'; '.join(exercises)}."
         user_text = (
-            "Create an evening recap for TODAY only. Summarize today's steps, workouts, "
-            "meals, hydration, and heart-rate activity. Reflect on what went well and "
-            "give practical sleep-prep advice for tonight. Do not discuss multi-day trends."
+            "Create an evening recap for TODAY only. List each meal and workout logged today "
+            "with calories/protein where available. Compare total protein and calories to the "
+            "user's active nutrition goals and give a clear on-track / mixed / off-track verdict. "
+            "Reflect on what went well and give practical sleep-prep advice for tonight. "
+            "Do not discuss multi-day trends."
         )
         if adherence.get("plan_adherence"):
             pa = adherence["plan_adherence"]

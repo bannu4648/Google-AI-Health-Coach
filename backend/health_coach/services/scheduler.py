@@ -10,6 +10,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 
+from ..integrations.google_auth import GoogleAuthRequiredError, notify_google_auth_required
 from ..core.database import fetch_recent_messages_for_phone, record_job_run, utc_now_iso
 from ..core.timezone import get_user_tz, now_local
 from ..integrations.whatsapp import (
@@ -266,6 +267,17 @@ def run_summary_job(summary_type: str) -> dict:
             result=result,
         )
         return result
+    except GoogleAuthRequiredError as exc:
+        logger.warning("Scheduled %s summary needs Google re-auth: %s", summary_type, exc)
+        notify_google_auth_required(phone=SUMMARY_RECIPIENT_PHONE)
+        record_job_run(
+            job_name=f"{summary_type}_summary",
+            status="error",
+            started_at=started,
+            finished_at=utc_now_iso(),
+            error=str(exc),
+        )
+        return {"error": True, "message": str(exc)}
     except Exception as exc:
         logger.exception("Scheduled %s summary failed: %s", summary_type, exc)
         record_job_run(

@@ -1365,6 +1365,10 @@ def execute_health_action(
             return result
         return None
     except GoogleAuthRequiredError:
+        if sender_phone:
+            from ..integrations.google_auth import notify_google_auth_required
+
+            notify_google_auth_required(sender_phone)
         raise
     except GoogleHealthAPIError as exc:
         logger.error("Google Health API action failed: %s", exc)
