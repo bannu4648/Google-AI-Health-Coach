@@ -5,6 +5,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+echo "Installing Python dependencies..."
+python3 -m pip install -r requirements.txt -q
+
 echo "Starting FastAPI on http://localhost:8000"
 python3 -m uvicorn backend.health_coach.app:app --host 0.0.0.0 --port 8000 --reload &
 BACKEND_PID=$!

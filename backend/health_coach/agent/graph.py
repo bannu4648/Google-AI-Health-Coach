@@ -407,21 +407,23 @@ def _compose_confirm_message(payload: dict[str, Any]) -> str:
     return f"Log {food}{portion_bit} at ~{kcal} kcal to Google Health?"
 
 
-_checkpointer_ctx = None
 _checkpointer_instance = None
 
 
 def _create_checkpointer():
-    global _checkpointer_ctx, _checkpointer_instance
+    global _checkpointer_instance
     if _checkpointer_instance is not None:
         return _checkpointer_instance
     try:
+        import sqlite3
+
         from langgraph.checkpoint.sqlite import SqliteSaver
 
         path = Path(GRAPH_CHECKPOINT_PATH)
         path.parent.mkdir(parents=True, exist_ok=True)
-        _checkpointer_ctx = SqliteSaver.from_conn_string(str(path))
-        _checkpointer_instance = _checkpointer_ctx.__enter__()
+        conn = sqlite3.connect(str(path), check_same_thread=False)
+        _checkpointer_instance = SqliteSaver(conn)
+        _checkpointer_instance.setup()
         return _checkpointer_instance
     except Exception as exc:
         logger.warning("SqliteSaver unavailable (%s); using in-memory checkpointer.", exc)

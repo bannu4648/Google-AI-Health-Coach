@@ -5,6 +5,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+echo "Installing Python dependencies..."
+python3 -m pip install -r requirements.txt -q
+
 PORT="${PORT:-8000}"
 NGROK_LOG="${NGROK_LOG:-/tmp/health_coach_ngrok.log}"
 UVICORN_LOG="${UVICORN_LOG:-/tmp/health_coach_uvicorn.log}"

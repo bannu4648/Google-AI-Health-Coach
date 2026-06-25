@@ -41,7 +41,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="WhatsApp AI Health Coach",
     version="1.0.0",
-    description="Local WhatsApp health coach backed by Mistral, Google Health API v4, and Tavily.",
+    description="WhatsApp health coach with Gemini/GLM/Mistral routing, Google Health API v4, and Tavily.",
     lifespan=lifespan,
 )
 app.add_middleware(
