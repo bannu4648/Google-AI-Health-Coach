@@ -92,9 +92,10 @@ class FallbackLLMProvider:
     @staticmethod
     def is_rate_limit_error(exc: BaseException) -> bool:
         from .gemini import GeminiProvider
+        from .glm import GLMProvider
         from .mistral import MistralProvider
 
-        for provider in (GeminiProvider, MistralProvider):
+        for provider in (GeminiProvider, GLMProvider, MistralProvider):
             checker = getattr(provider, "is_rate_limit_error", None)
             if callable(checker) and checker(exc):
                 return True

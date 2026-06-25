@@ -77,6 +77,7 @@ def test_fallback_does_not_use_secondary_for_vision():
 
 
 def test_create_llm_provider_wraps_fallback_when_configured(monkeypatch):
+    monkeypatch.setenv("LLM_ROUTING_MODE", "all_google")
     monkeypatch.setenv("LLM_PROVIDER", "gemini")
     monkeypatch.setenv("LLM_FALLBACK_PROVIDER", "mistral")
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini")

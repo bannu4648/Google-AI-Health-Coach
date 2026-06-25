@@ -38,6 +38,7 @@ SECRET_KEYS = {
     "refresh_token",
     "client_secret",
     "mistral_api_key",
+    "cloudflare_api_token",
     "whatsapp_access_token",
 }
 

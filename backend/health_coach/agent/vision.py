@@ -75,8 +75,8 @@ class VisionAnalysis(BaseModel):
 class VisionAgent:
     """Vision specialist for meal photos (requires a vision-capable provider, e.g. Gemini)."""
 
-    def __init__(self, client: LLMProvider | None = None):
-        self._client = client or create_llm_provider()
+    def __init__(self, client: LLMProvider | None = None, *, vision_client: LLMProvider | None = None):
+        self._client = vision_client or client or create_llm_provider()
 
     def analyze_food_image(
         self,
@@ -105,7 +105,7 @@ class VisionAgent:
                 images=[(image_bytes, mime_type)],
             )
         except Exception as exc:
-            logger.exception("Vision agent Gemini error: %s", exc)
+            logger.exception("Vision agent %s error: %s", self._client.provider_name, exc)
             parsed = None
 
         if parsed is None:

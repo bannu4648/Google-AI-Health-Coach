@@ -439,7 +439,7 @@ def build_coach_graph(
 ):
     engine = ai_engine or AIEngine()
     client = health_client or GoogleHealthClient()
-    vision = VisionAgent(client=engine._client)
+    vision = VisionAgent(client=engine.vision_llm)
 
     def _llm_context(state: CoachState, *, include_health_snapshot: bool = True) -> dict[str, str]:
         return build_llm_context(

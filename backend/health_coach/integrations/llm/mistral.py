@@ -15,7 +15,7 @@ load_dotenv()
 DEFAULT_MODEL = os.getenv("MISTRAL_MODEL", os.getenv("LLM_MODEL", "mistral-large-latest"))
 DEFAULT_API_KEY = os.getenv("MISTRAL_API_KEY", os.getenv("LLM_API_KEY", ""))
 DEFAULT_CALL_DELAY = float(
-    os.getenv("MISTRAL_CALL_DELAY_SECONDS", os.getenv("LLM_CALL_DELAY_SECONDS", "2"))
+    os.getenv("MISTRAL_CALL_DELAY_SECONDS", os.getenv("LLM_CALL_DELAY_SECONDS", "0"))
 )
 DEFAULT_MAX_RETRIES = int(
     os.getenv("MISTRAL_RATE_LIMIT_MAX_RETRIES", os.getenv("LLM_RATE_LIMIT_MAX_RETRIES", "3"))

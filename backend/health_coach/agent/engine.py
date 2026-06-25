@@ -6,7 +6,7 @@ Specialist agents:
 - Vision (agent/vision.py) — food photo analysis
 - Nutrition / research — resolved via Tavily + structured LLM output
 
-Swap providers via LLM_PROVIDER in .env (gemini, mistral, …).
+Swap providers via LLM_ROUTING_MODE in .env (all_google, gemini_glm, gemini_mistral).
 """
 
 from __future__ import annotations
@@ -821,7 +821,23 @@ class AIEngine:
     def llm(self) -> LLMProvider:
         return self._llm
 
-    # Backward-compatible alias used by graph.py (vision shares the same provider).
+    @property
+    def vision_llm(self) -> LLMProvider:
+        """Vision/multimodal provider — Gemini in dual-model modes."""
+        vision = getattr(self._llm, "vision", None)
+        if vision is not None:
+            return vision
+        return self._llm
+
+    @property
+    def text_llm(self) -> LLMProvider:
+        """Text/reasoning provider — GLM or Mistral in dual-model modes."""
+        text = getattr(self._llm, "text", None)
+        if text is not None:
+            return text
+        return self._llm
+
+    # Backward-compatible alias used by graph.py (vision should use vision_llm).
     @property
     def _client(self) -> LLMProvider:
         return self._llm
