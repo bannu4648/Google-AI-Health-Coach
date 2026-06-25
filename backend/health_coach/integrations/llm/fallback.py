@@ -38,6 +38,14 @@ def _is_fallbackable(exc: BaseException, primary: LLMProvider) -> bool:
     except ImportError:
         pass
 
+    try:
+        import requests
+
+        if isinstance(exc, (ConnectionError, requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+            return True
+    except ImportError:
+        pass
+
     message = str(exc).lower()
     transient_markers = (
         "429",
@@ -51,6 +59,9 @@ def _is_fallbackable(exc: BaseException, primary: LLMProvider) -> bool:
         "internal error",
         "resource exhausted",
         "overloaded",
+        "connection aborted",
+        "remote end closed",
+        "connection error",
     )
     return any(marker in message for marker in transient_markers)
 

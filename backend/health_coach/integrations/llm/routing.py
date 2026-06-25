@@ -12,6 +12,17 @@ from .protocol import LLMProvider
 
 logger = logging.getLogger(__name__)
 
+# Long-context summarization and research stay on Gemini — GLM times out on large payloads.
+GEMINI_REASONING_PURPOSES = frozenset(
+    {
+        "summarize_health_data",
+        "summarize_coach_data",
+        "answer_research_question",
+        "generate_wellness_plan",
+        "evaluate_day",
+    }
+)
+
 
 class DualModelLLMProvider:
     """
@@ -57,6 +68,18 @@ class DualModelLLMProvider:
         message = str(exc).lower()
         return "429" in message or "rate limit" in message or "quota" in message
 
+    def _provider_for_purpose(
+        self,
+        purpose: str,
+        *,
+        images: list[tuple[bytes, str]] | None,
+    ) -> LLMProvider:
+        if images:
+            return self._vision
+        if purpose in GEMINI_REASONING_PURPOSES:
+            return self._vision
+        return self._text
+
     def generate_json(
         self,
         *,
@@ -66,25 +89,20 @@ class DualModelLLMProvider:
         temperature: float = 0.2,
         images: list[tuple[bytes, str]] | None = None,
     ) -> dict[str, Any]:
-        if images:
-            self._last_used = self._vision
-            logger.debug("DualModel routing %s to vision provider (%s)", purpose, self._vision.provider_name)
-            return self._vision.generate_json(
-                purpose=purpose,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                temperature=temperature,
-                images=images,
-            )
-
-        self._last_used = self._text
-        logger.debug("DualModel routing %s to text provider (%s)", purpose, self._text.provider_name)
-        return self._text.generate_json(
+        provider = self._provider_for_purpose(purpose, images=images)
+        self._last_used = provider
+        logger.debug(
+            "DualModel routing %s to %s provider (%s)",
+            purpose,
+            "vision" if provider is self._vision else "text",
+            provider.provider_name,
+        )
+        return provider.generate_json(
             purpose=purpose,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             temperature=temperature,
-            images=None,
+            images=images,
         )
 
     def generate_structured(

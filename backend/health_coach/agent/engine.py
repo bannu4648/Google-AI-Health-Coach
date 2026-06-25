@@ -1286,7 +1286,7 @@ class AIEngine:
                 prompt={"user_text": user_text, "draft_reply": draft_reply, "api_result": api_result},
                 error=str(exc),
             )
-            logger.exception("Gemini summarize error: %s", exc)
+            logger.exception("LLM summarize error (%s): %s", self._model, exc)
             return draft_reply
 
     def summarize_coach_data(

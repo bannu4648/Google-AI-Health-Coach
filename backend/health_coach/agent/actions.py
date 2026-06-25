@@ -22,7 +22,15 @@ from ..core.payloads import (
     fix_exercise_data_point_structure,
     normalize_router_payload,
 )
-from ..core.timezone import default_query_range_utc, get_user_tz, parse_to_utc
+from datetime import timezone
+
+from ..core.timezone import (
+    default_query_range_utc,
+    format_utc_iso,
+    get_user_tz,
+    now_local,
+    parse_to_utc,
+)
 from ..core.types import normalize_query_payload
 from ..integrations.google_auth import GoogleAuthRequiredError
 from ..integrations.google_health import GoogleHealthAPIError, GoogleHealthClient
@@ -104,6 +112,17 @@ def _fitness_plan_scope(payload: dict[str, Any], user_text: str) -> str:
     if payload.get("day_filter"):
         return "filtered"
     return "full_week"
+
+
+def _normalize_history_range(start: str | None, end: str | None) -> tuple[str, str]:
+    """Ensure history queries include data through the current moment."""
+    if not start or not end:
+        return default_week_range()
+    end_dt = parse_to_utc(end)
+    now_utc = parse_to_utc(format_utc_iso(now_local().astimezone(timezone.utc)))
+    if end_dt < now_utc:
+        return start, format_utc_iso(now_utc)
+    return start, end
 
 
 def default_week_range() -> tuple[str, str]:
@@ -1308,10 +1327,10 @@ def execute_health_action(
             record_health_action(intent_value.value, status="success", payload=payload, result=result)
             return result
         if intent_value == Intent.QUERY_HISTORY:
-            start = payload.get("start_time")
-            end = payload.get("end_time")
-            if not start or not end:
-                start, end = default_week_range()
+            start, end = _normalize_history_range(
+                payload.get("start_time"),
+                payload.get("end_time"),
+            )
             data_type = payload.get("data_type", "nutrition-log")
             result = health_client.list_all_data_points(
                 data_type,

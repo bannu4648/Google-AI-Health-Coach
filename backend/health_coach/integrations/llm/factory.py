@@ -87,7 +87,7 @@ def _maybe_wrap_fallback(
         return primary
     if not fallback_name:
         if primary.provider_name == "glm":
-            fallback_name = "mistral"
+            fallback_name = "gemini"
         elif primary.provider_name == "mistral":
             fallback_name = "gemini"
         else:

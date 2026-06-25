@@ -75,6 +75,23 @@ def test_dual_model_routes_images_to_vision_provider():
     assert provider.provider_name == "gemini"
 
 
+def test_dual_model_routes_summarize_health_to_vision_provider():
+    vision = _FakeProvider("gemini", "gemini-2.5-flash")
+    text = _FakeProvider("glm", "@cf/zai-org/glm-5.2")
+    provider = DualModelLLMProvider(vision=vision, text=text)
+
+    result = provider.generate_json(
+        purpose="summarize_health_data",
+        system_prompt="sys",
+        user_prompt="user",
+    )
+
+    assert result == {"provider": "gemini", "vision": False}
+    assert vision.calls == ["summarize_health_data"]
+    assert text.calls == []
+    assert provider.provider_name == "gemini"
+
+
 def test_dual_model_delegates_multimodal_helpers():
     vision = _FakeProvider("gemini", "gemini-2.5-flash")
     text = _FakeProvider("glm", "@cf/zai-org/glm-5.2")
